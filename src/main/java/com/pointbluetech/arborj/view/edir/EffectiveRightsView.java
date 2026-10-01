@@ -1,11 +1,13 @@
 package com.pointbluetech.arborj.view.edir;
 
 import com.pointbluetech.arborj.controller.MainController;
+import com.pointbluetech.arborj.service.AttributeSuggestSettings;
 import com.pointbluetech.arborj.model.EffectiveRights;
 import com.pointbluetech.arborj.model.EffectiveRights.AttributeRight;
 import com.pointbluetech.arborj.model.EffectiveRights.EntryRight;
 import com.pointbluetech.arborj.view.DNPickerDialog;
 import javafx.application.Platform;
+import javafx.beans.value.ChangeListener;
 import javafx.collections.FXCollections;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
@@ -97,16 +99,41 @@ public class EffectiveRightsView extends Dialog<Void> {
 
         // Populate from schema
         var attrMap = controller.getSchemaService().getAttributeMap();
-        if (attrMap != null && !attrMap.isEmpty()) {
-            List<String> sorted = attrMap.keySet().stream().sorted().toList();
-            attributeCombo.setItems(FXCollections.observableArrayList(sorted));
+        List<String> allAttributes = (attrMap == null || attrMap.isEmpty())
+                ? List.of()
+                : attrMap.keySet().stream().sorted().toList();
+        if (!allAttributes.isEmpty()) {
+            attributeCombo.setItems(FXCollections.observableArrayList(allAttributes));
         }
+
+        // Restore the full schema list only while the combo is still filtered.
+        // A keystroke against the complete list must leave an open dropdown alone.
+        Runnable restoreFullAttributeList = () -> {
+            if (allAttributes.isEmpty() || attributeCombo.getItems().equals(allAttributes)) return;
+            String editorText = attributeCombo.getEditor().getText();
+            attributeCombo.getItems().setAll(allAttributes);
+            attributeCombo.getEditor().setText(editorText);
+            attributeCombo.hide();
+        };
+        ChangeListener<Boolean> suggestListener = (obs, wasEnabled, enabled) -> {
+            if (!enabled) {
+                restoreFullAttributeList.run();
+                attributeCombo.hide();
+            }
+        };
+        var suggestSettings = AttributeSuggestSettings.getInstance();
+        suggestSettings.enabledProperty().addListener(suggestListener);
+        setOnHidden(e -> suggestSettings.enabledProperty().removeListener(suggestListener));
 
         // Filter as user types
         attributeCombo.getEditor().textProperty().addListener((obs, oldVal, newVal) -> {
+            if (!AttributeSuggestSettings.getInstance().isEnabled()) {
+                restoreFullAttributeList.run();
+                return;
+            }
             if (newVal == null || newVal.isEmpty()) {
-                if (attrMap != null) {
-                    attributeCombo.getItems().setAll(attrMap.keySet().stream().sorted().toList());
+                if (!allAttributes.isEmpty()) {
+                    attributeCombo.getItems().setAll(allAttributes);
                 }
                 return;
             }

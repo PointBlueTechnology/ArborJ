@@ -12,6 +12,18 @@ unicodePwd, schema variations).
 Signed installers for macOS and Windows and a Linux tarball are available
 from [pointbluetech.com/arborj](https://www.pointbluetech.com/arborj/).
 
+### On a Mac? Try Arbor
+
+**Mac users should consider [Arbor](https://www.pointbluetech.com/)**, the
+commercial native macOS version of this tool. It's built in SwiftUI, needs no
+Java runtime, runs natively on Apple Silicon and Intel, and syncs profiles
+through iCloud. It's on the Mac App Store in two editions:
+
+- [Arbor LDAP Browser](https://apps.apple.com/us/app/arbor-ldap-browser/id6759270047?mt=12):
+  free, with Pro features as an in-app purchase.
+- [ArborPro LDAP Browser](https://apps.apple.com/us/app/arborpro-ldap-browser/id6802792427?mt=12):
+  a one-time upfront purchase, suited to enterprise and volume purchasing.
+
 ---
 
 ## Table of contents

@@ -1,6 +1,7 @@
 package com.pointbluetech.arborj.view;
 
 import com.pointbluetech.arborj.controller.MainController;
+import com.pointbluetech.arborj.service.AttributeSuggestSettings;
 import javafx.collections.FXCollections;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
@@ -830,6 +831,7 @@ public class FilterBuilderDialog extends Stage {
         ContextMenu suggestions = new ContextMenu();
         field.textProperty().addListener((_, _, newVal) -> {
             suggestions.hide();
+            if (!AttributeSuggestSettings.getInstance().isEnabled()) return;
             if (newVal == null || newVal.length() < 2) return;
             try {
                 var attrMap = controller.getSchemaService().getAttributeMap();

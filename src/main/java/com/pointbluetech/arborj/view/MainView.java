@@ -34,6 +34,13 @@ public class MainView {
     private Label tableViewLink;
     private boolean smartInsertEnabled = java.util.prefs.Preferences
             .userNodeForPackage(MainView.class).getBoolean("smartInsert", true);
+    /** Search-filter attribute suggestions. A heavyweight Popup, so it can take focus. */
+    private javafx.stage.Popup searchSuggestionPopup;
+    private ListView<String> searchSuggestionList;
+    /** When Esc dismissed suggestions; a follow-up delivery of that key must not clear results. */
+    private boolean suggestionEscapeDismissed;
+    private long suggestionEscapeDismissedAtNanos;
+    private static final long SUGGESTION_ESCAPE_GUARD_NANOS = 250_000_000L;
     private final javafx.beans.property.BooleanProperty logPaneVisible =
             new javafx.beans.property.SimpleBooleanProperty(false);
 
@@ -121,8 +128,19 @@ public class MainView {
                 refreshSelectedNodeOrTree();
                 e.consume();
             } else if (e.getCode() == javafx.scene.input.KeyCode.ESCAPE) {
-                // Escape: Clear search results
-                if (!controller.getSearchResults().isEmpty()) {
+                // Dismiss attribute suggestions first. This filter runs in the
+                // capture phase, before the text field, and Esc must not also
+                // clear search results — including a second delivery after the
+                // popup window hid and focus returned here.
+                if (isSearchSuggestionPopupShowing()) {
+                    dismissSearchSuggestions();
+                    e.consume();
+                } else if (suggestionEscapeJustDismissed()) {
+                    // Same key (or a repeat) after the popup hid. Consume it
+                    // without re-arming the guard or moving focus, so a later
+                    // Esc can still clear search results.
+                    e.consume();
+                } else if (!controller.getSearchResults().isEmpty()) {
                     controller.clearSearch();
                     contentSplit.getItems().remove(searchResultsList);
                     e.consume();
@@ -479,6 +497,89 @@ public class MainView {
         return toolbar;
     }
 
+    private boolean isSearchSuggestionPopupShowing() {
+        return searchSuggestionPopup != null && searchSuggestionPopup.isShowing();
+    }
+
+    private boolean suggestionEscapeJustDismissed() {
+        return suggestionEscapeDismissed
+                && System.nanoTime() - suggestionEscapeDismissedAtNanos < SUGGESTION_ESCAPE_GUARD_NANOS;
+    }
+
+    /**
+     * True when keyboard focus is in the suggestion list. Popup.isFocused()
+     * follows the owner window, so it stays true while the main window is focused.
+     */
+    private boolean searchSuggestionPopupHasFocus() {
+        if (!isSearchSuggestionPopupShowing() || searchSuggestionList == null) return false;
+        var scene = searchSuggestionPopup.getScene();
+        if (scene == null) return false;
+        for (var node = scene.getFocusOwner(); node != null; node = node.getParent()) {
+            if (node == searchSuggestionList) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Hide attribute suggestions and return keyboard focus to the search filter.
+     * Does not clear search results.
+     */
+    private void dismissSearchSuggestions() {
+        if (searchSuggestionPopup != null) {
+            searchSuggestionPopup.hide();
+        }
+        suggestionEscapeDismissed = true;
+        suggestionEscapeDismissedAtNanos = System.nanoTime();
+        if (searchFilterField != null) {
+            searchFilterField.requestFocus();
+        }
+    }
+
+    private void handleSearchSuggestionKeys(javafx.scene.input.KeyEvent ev,
+                                            ListView<String> list,
+                                            Runnable applySuggestion) {
+        if (!isSearchSuggestionPopupShowing()) return;
+        switch (ev.getCode()) {
+            case DOWN -> {
+                int last = list.getItems().size() - 1;
+                if (last < 0) return;
+                int idx = list.getSelectionModel().getSelectedIndex();
+                list.getSelectionModel().select(Math.min(idx + 1, last));
+                list.scrollTo(list.getSelectionModel().getSelectedIndex());
+                ev.consume();
+            }
+            case UP -> {
+                if (list.getItems().isEmpty()) return;
+                int idx = list.getSelectionModel().getSelectedIndex();
+                list.getSelectionModel().select(Math.max(idx - 1, 0));
+                list.scrollTo(list.getSelectionModel().getSelectedIndex());
+                ev.consume();
+            }
+            case ENTER, TAB -> {
+                if (list.getSelectionModel().getSelectedIndex() >= 0) {
+                    applySuggestion.run();
+                    ev.consume();
+                }
+            }
+            case ESCAPE -> {
+                dismissSearchSuggestions();
+                ev.consume();
+            }
+            default -> {}
+        }
+    }
+
+    /** Keys still arrive when focus is on the popup scene rather than the list. */
+    private void installSearchSuggestionPopupKeys(ListView<String> list, Runnable applySuggestion) {
+        var scene = list.getScene();
+        if (scene == null) return;
+        final String marker = "arborjSearchSuggestionKeys";
+        if (Boolean.TRUE.equals(scene.getProperties().get(marker))) return;
+        scene.getProperties().put(marker, Boolean.TRUE);
+        scene.addEventFilter(javafx.scene.input.KeyEvent.KEY_PRESSED, ev ->
+                handleSearchSuggestionKeys(ev, list, applySuggestion));
+    }
+
     private VBox buildSearchBar() {
         VBox searchBar = new VBox(4);
         searchBar.getStyleClass().add("search-bar");
@@ -496,13 +597,20 @@ public class MainView {
 
         // Autocomplete popup
         ListView<String> autoComplete = new ListView<>();
+        searchSuggestionList = autoComplete;
         autoComplete.setMaxHeight(200);
         autoComplete.setPrefHeight(150);
         autoComplete.setStyle("-fx-font-family: monospaced; -fx-font-size: 12;");
 
-        // Autocomplete as a floating popup (not in layout)
+        // Autocomplete as a floating popup (not in layout). On Windows this
+        // heavyweight window can take keyboard focus, so keys are also handled
+        // on the popup content.
         javafx.stage.Popup autoPopup = new javafx.stage.Popup();
+        searchSuggestionPopup = autoPopup;
         autoPopup.setAutoHide(true);
+        // Default is true, which hides the popup without arming the guard.
+        // Esc is handled only by the explicit dismiss path.
+        autoPopup.setHideOnEscape(false);
         autoPopup.getContent().add(autoComplete);
 
         Runnable showAutoComplete = () -> {
@@ -516,7 +624,16 @@ public class MainView {
         };
         Runnable hideAutoComplete = () -> autoPopup.hide();
 
+        var suggestSettings = com.pointbluetech.arborj.service.AttributeSuggestSettings.getInstance();
+        suggestSettings.enabledProperty().addListener((obs, wasEnabled, enabled) -> {
+            if (!enabled) hideAutoComplete.run();
+        });
+
         Runnable updateSuggestions = () -> {
+            if (!suggestSettings.isEnabled()) {
+                hideAutoComplete.run();
+                return;
+            }
             int cursor = filterField.getCaretPosition();
             String token = com.pointbluetech.arborj.util.LDAPFilterValidator
                     .attributeTokenAt(cursor, filterField.getText());
@@ -556,7 +673,7 @@ public class MainView {
                 filterField.positionCaret(tokenStart + selected.length());
             }
             hideAutoComplete.run();
-            };
+        };
 
         filterField.textProperty().addListener((obs, o, n) -> updateSuggestions.run());
         filterField.caretPositionProperty().addListener((obs, o, n) -> updateSuggestions.run());
@@ -564,46 +681,23 @@ public class MainView {
         // Click to apply suggestion
         autoComplete.setOnMouseClicked(ev -> applySuggestion.run());
 
-        // Arrow keys and Enter in filter field navigate the autocomplete
-        filterField.addEventFilter(javafx.scene.input.KeyEvent.KEY_PRESSED, ev -> {
-            if (!autoPopup.isShowing()) return;
-            switch (ev.getCode()) {
-                case DOWN -> {
-                    int idx = autoComplete.getSelectionModel().getSelectedIndex();
-                    autoComplete.getSelectionModel().select(Math.min(idx + 1, autoComplete.getItems().size() - 1));
-                    autoComplete.scrollTo(autoComplete.getSelectionModel().getSelectedIndex());
-                    ev.consume();
-                }
-                case UP -> {
-                    int idx = autoComplete.getSelectionModel().getSelectedIndex();
-                    autoComplete.getSelectionModel().select(Math.max(idx - 1, 0));
-                    autoComplete.scrollTo(autoComplete.getSelectionModel().getSelectedIndex());
-                    ev.consume();
-                }
-                case ENTER, TAB -> {
-                    if (autoComplete.getSelectionModel().getSelectedIndex() >= 0) {
-                        applySuggestion.run();
-                        ev.consume();
-                    }
-                }
-                case ESCAPE -> {
-                    hideAutoComplete.run();
-                                ev.consume();
-                }
-                default -> {}
-            }
-        });
+        // Keys on the text field, and on the popup when it has taken focus.
+        filterField.addEventFilter(javafx.scene.input.KeyEvent.KEY_PRESSED, ev ->
+                handleSearchSuggestionKeys(ev, autoComplete, applySuggestion));
+        autoComplete.addEventFilter(javafx.scene.input.KeyEvent.KEY_PRESSED, ev ->
+                handleSearchSuggestionKeys(ev, autoComplete, applySuggestion));
+        autoPopup.setOnShown(ev -> installSearchSuggestionPopupKeys(autoComplete, applySuggestion));
 
-        // Hide autocomplete when focus leaves filter
+        // Hide autocomplete when focus leaves the filter, unless the popup
+        // itself has focus (a click on the list, or Windows moving focus there).
         filterField.focusedProperty().addListener((obs, o, focused) -> {
             if (!focused) {
-                // Delay to allow click on autocomplete list
                 javafx.animation.PauseTransition pause = new javafx.animation.PauseTransition(
                         javafx.util.Duration.millis(200));
                 pause.setOnFinished(ev -> {
-                    if (!filterField.isFocused()) {
+                    if (!filterField.isFocused() && !searchSuggestionPopupHasFocus()) {
                         hideAutoComplete.run();
-                                    }
+                    }
                 });
                 pause.play();
             }

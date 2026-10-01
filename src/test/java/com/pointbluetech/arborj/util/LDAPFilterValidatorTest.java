@@ -126,4 +126,59 @@ class LDAPFilterValidatorTest {
         // Cursor past the end of string => null.
         assertNull(LDAPFilterValidator.attributeTokenAt(50, "(cn=alice)"));
     }
+
+    @Test
+    @DisplayName("attributeTokenAt stops at the assertion operator")
+    void attributeTokenAtStopsAfterEquals() {
+        String filter = "(cn=bob)";
+        assertEquals("cn", LDAPFilterValidator.attributeTokenAt(2, filter));
+        assertEquals("cn", LDAPFilterValidator.attributeTokenAt(3, filter)); // caret before '='
+        assertNull(LDAPFilterValidator.attributeTokenAt(4, filter));          // caret just after '='
+        assertNull(LDAPFilterValidator.attributeTokenAt(5, filter));          // caret in the value
+    }
+
+    @Test
+    @DisplayName("attributeTokenAt ignores DN components inside an assertion value")
+    void attributeTokenAtIgnoresDnValues() {
+        String filter = "(member=cn=admin,ou=users)";
+        assertEquals("member", LDAPFilterValidator.attributeTokenAt(filter.indexOf("member") + 3, filter));
+        assertNull(LDAPFilterValidator.attributeTokenAt(filter.indexOf("=cn=") + 2, filter));
+        assertNull(LDAPFilterValidator.attributeTokenAt(filter.indexOf("admin") + 1, filter));
+        assertNull(LDAPFilterValidator.attributeTokenAt(filter.indexOf("ou=") + 1, filter));
+    }
+
+    @Test
+    @DisplayName("attributeTokenAt still finds attributes in later filter items")
+    void attributeTokenAtFindsLaterAssertions() {
+        String filter = "(&(objectClass=person)(!(cn=bob)))";
+        assertEquals("objectClass",
+                LDAPFilterValidator.attributeTokenAt(filter.indexOf("objectClass") + 4, filter));
+        assertNull(LDAPFilterValidator.attributeTokenAt(filter.indexOf("person") + 1, filter));
+        int cn = filter.indexOf("(cn=") + 1;
+        assertEquals("cn", LDAPFilterValidator.attributeTokenAt(cn + 2, filter));
+        assertNull(LDAPFilterValidator.attributeTokenAt(cn + 3, filter));
+        assertNull(LDAPFilterValidator.attributeTokenAt(filter.indexOf("bob") + 1, filter));
+    }
+
+    @Test
+    @DisplayName("attributeTokenAt treats compound operators as the value boundary")
+    void attributeTokenAtCompoundOperators() {
+        assertEquals("age", LDAPFilterValidator.attributeTokenAt(3, "(age>=18)"));
+        assertNull(LDAPFilterValidator.attributeTokenAt("(age>=18)".indexOf('=') + 1, "(age>=18)"));
+        assertNull(LDAPFilterValidator.attributeTokenAt("(cn~=smith)".indexOf("smith") + 1, "(cn~=smith)"));
+        String spaced = "( cn = bob )";
+        assertEquals("cn", LDAPFilterValidator.attributeTokenAt(spaced.indexOf("cn") + 1, spaced));
+        assertNull(LDAPFilterValidator.attributeTokenAt(spaced.indexOf("bob") + 1, spaced));
+    }
+
+    @Test
+    @DisplayName("attributeTokenAt still returns a partial name before any operator")
+    void attributeTokenAtPartialName() {
+        assertEquals("mail", LDAPFilterValidator.attributeTokenAt(5, "(mail"));
+        assertEquals("cn", LDAPFilterValidator.attributeTokenAt(2, "cn"));
+        assertNull(LDAPFilterValidator.attributeTokenAt(3, "cn="));
+        String ext = "(cn:caseExactMatch:=Fred)";
+        assertEquals("cn", LDAPFilterValidator.attributeTokenAt(ext.indexOf("cn") + 1, ext));
+        assertNull(LDAPFilterValidator.attributeTokenAt(ext.indexOf("Fred") + 1, ext));
+    }
 }

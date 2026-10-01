@@ -1,6 +1,7 @@
 package com.pointbluetech.arborj.view;
 
 import com.pointbluetech.arborj.controller.MainController;
+import com.pointbluetech.arborj.service.AttributeSuggestSettings;
 import com.pointbluetech.arborj.model.DirectoryType;
 import com.pointbluetech.arborj.model.LDAPAttributeInfo;
 import com.pointbluetech.arborj.model.LDAPAttributeSyntax;
@@ -340,6 +341,10 @@ public final class EntryContextMenu {
         };
 
         Runnable update = () -> {
+            if (!AttributeSuggestSettings.getInstance().isEnabled()) {
+                hide.run();
+                return;
+            }
             String text = field.getText();
             String lower = text == null ? "" : text.toLowerCase().trim();
             if (lower.length() < 1) { hide.run(); return; }

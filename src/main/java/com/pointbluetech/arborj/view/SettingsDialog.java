@@ -1,6 +1,7 @@
 package com.pointbluetech.arborj.view;
 
 import com.pointbluetech.arborj.ArborJApp;
+import com.pointbluetech.arborj.service.AttributeSuggestSettings;
 import com.pointbluetech.arborj.service.FontSettings;
 import javafx.geometry.Insets;
 import javafx.scene.Scene;
@@ -50,7 +51,7 @@ public class SettingsDialog {
         }
 
         VBox root = new VBox(tabs);
-        Scene scene = new Scene(root, 520, 520);
+        Scene scene = new Scene(root, 520, 640);
         stage.setScene(scene);
     }
 
@@ -159,6 +160,25 @@ public class SettingsDialog {
                 + "-fx-background-radius: 4;");
         preview.setMaxWidth(Double.MAX_VALUE);
         grid.add(preview, 1, row++);
+
+        grid.add(new Separator(), 0, row++, 2, 1);
+
+        Label suggestHeader = new Label("Suggestions");
+        suggestHeader.setStyle("-fx-font-weight: bold;");
+        grid.add(suggestHeader, 0, row++, 2, 1);
+
+        CheckBox suggestNames = new CheckBox("Suggest attribute names as you type");
+        suggestNames.selectedProperty().bindBidirectional(
+                AttributeSuggestSettings.getInstance().enabledProperty());
+        grid.add(suggestNames, 0, row++, 2, 1);
+
+        Label suggestNote = new Label(
+                "Shows matching schema attribute names in the search filter, Filter Builder, "
+                        + "Add Attribute, and Effective Rights.");
+        suggestNote.setStyle("-fx-text-fill: -color-fg-muted; -fx-font-size: 11;");
+        suggestNote.setWrapText(true);
+        suggestNote.setMaxWidth(460);
+        grid.add(suggestNote, 0, row++, 2, 1);
 
         // Column constraints
         ColumnConstraints labelCol = new ColumnConstraints();
