@@ -57,11 +57,7 @@ public class LDAPFilterValidator {
         while (end + 1 < chars.length && isAttrChar(chars[end + 1])) end++;
         if (start > end) return null;
         String token = filter.substring(start, end + 1);
-        if (token.isEmpty()) return null;
-        for (int i = 0; i < token.length(); i++) {
-            if (!isAttrChar(token.charAt(i))) return null;
-        }
-        return token;
+        return token.isEmpty() ? null : token;
     }
 
     /**

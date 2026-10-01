@@ -131,8 +131,13 @@ public class MainView {
                 // capture phase, before the text field, and Esc must not also
                 // clear search results — including a second delivery after the
                 // popup window hid and focus returned here.
-                if (isSearchSuggestionPopupShowing() || suggestionEscapeJustDismissed()) {
+                if (isSearchSuggestionPopupShowing()) {
                     dismissSearchSuggestions();
+                    e.consume();
+                } else if (suggestionEscapeJustDismissed()) {
+                    // Same key (or a repeat) after the popup hid. Consume it
+                    // without re-arming the guard or moving focus, so a later
+                    // Esc can still clear search results.
                     e.consume();
                 } else if (!controller.getSearchResults().isEmpty()) {
                     controller.clearSearch();
@@ -501,10 +506,7 @@ public class MainView {
     }
 
     private boolean searchSuggestionPopupHasFocus() {
-        if (!isSearchSuggestionPopupShowing()) return false;
-        if (searchSuggestionPopup.isFocused()) return true;
-        var scene = searchSuggestionPopup.getScene();
-        return scene != null && scene.getFocusOwner() != null;
+        return isSearchSuggestionPopupShowing() && searchSuggestionPopup.isFocused();
     }
 
     /**

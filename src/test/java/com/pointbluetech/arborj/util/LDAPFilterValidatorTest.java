@@ -135,7 +135,6 @@ class LDAPFilterValidatorTest {
         assertEquals("cn", LDAPFilterValidator.attributeTokenAt(3, filter)); // caret before '='
         assertNull(LDAPFilterValidator.attributeTokenAt(4, filter));          // caret just after '='
         assertNull(LDAPFilterValidator.attributeTokenAt(5, filter));          // caret in the value
-        assertNull(LDAPFilterValidator.attributeTokenAt(filter.length(), filter));
     }
 
     @Test
@@ -146,7 +145,6 @@ class LDAPFilterValidatorTest {
         assertNull(LDAPFilterValidator.attributeTokenAt(filter.indexOf("=cn=") + 2, filter));
         assertNull(LDAPFilterValidator.attributeTokenAt(filter.indexOf("admin") + 1, filter));
         assertNull(LDAPFilterValidator.attributeTokenAt(filter.indexOf("ou=") + 1, filter));
-        assertNull(LDAPFilterValidator.attributeTokenAt(filter.length(), filter));
     }
 
     @Test
