@@ -36,6 +36,7 @@ public class MainView {
             .userNodeForPackage(MainView.class).getBoolean("smartInsert", true);
     /** Search-filter attribute suggestions. A heavyweight Popup, so it can take focus. */
     private javafx.stage.Popup searchSuggestionPopup;
+    private ListView<String> searchSuggestionList;
     /** When Esc dismissed suggestions; a follow-up delivery of that key must not clear results. */
     private boolean suggestionEscapeDismissed;
     private long suggestionEscapeDismissedAtNanos;
@@ -505,8 +506,18 @@ public class MainView {
                 && System.nanoTime() - suggestionEscapeDismissedAtNanos < SUGGESTION_ESCAPE_GUARD_NANOS;
     }
 
+    /**
+     * True when keyboard focus is in the suggestion list. Popup.isFocused()
+     * follows the owner window, so it stays true while the main window is focused.
+     */
     private boolean searchSuggestionPopupHasFocus() {
-        return isSearchSuggestionPopupShowing() && searchSuggestionPopup.isFocused();
+        if (!isSearchSuggestionPopupShowing() || searchSuggestionList == null) return false;
+        var scene = searchSuggestionPopup.getScene();
+        if (scene == null) return false;
+        for (var node = scene.getFocusOwner(); node != null; node = node.getParent()) {
+            if (node == searchSuggestionList) return true;
+        }
+        return false;
     }
 
     /**
@@ -586,6 +597,7 @@ public class MainView {
 
         // Autocomplete popup
         ListView<String> autoComplete = new ListView<>();
+        searchSuggestionList = autoComplete;
         autoComplete.setMaxHeight(200);
         autoComplete.setPrefHeight(150);
         autoComplete.setStyle("-fx-font-family: monospaced; -fx-font-size: 12;");
