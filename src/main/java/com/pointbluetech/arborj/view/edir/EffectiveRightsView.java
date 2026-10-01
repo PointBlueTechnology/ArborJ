@@ -7,6 +7,7 @@ import com.pointbluetech.arborj.model.EffectiveRights.AttributeRight;
 import com.pointbluetech.arborj.model.EffectiveRights.EntryRight;
 import com.pointbluetech.arborj.view.DNPickerDialog;
 import javafx.application.Platform;
+import javafx.beans.value.ChangeListener;
 import javafx.collections.FXCollections;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
@@ -105,24 +106,29 @@ public class EffectiveRightsView extends Dialog<Void> {
             attributeCombo.setItems(FXCollections.observableArrayList(allAttributes));
         }
 
-        // Suggestions off: full schema list, dropdown closed. Also runs when the
-        // preference flips off while this dialog is open.
-        Runnable showFullAttributeList = () -> {
-            if (!allAttributes.isEmpty() && !attributeCombo.getItems().equals(allAttributes)) {
-                String editorText = attributeCombo.getEditor().getText();
-                attributeCombo.getItems().setAll(allAttributes);
-                attributeCombo.getEditor().setText(editorText);
-            }
+        // Restore the full schema list only while the combo is still filtered.
+        // A keystroke against the complete list must leave an open dropdown alone.
+        Runnable restoreFullAttributeList = () -> {
+            if (allAttributes.isEmpty() || attributeCombo.getItems().equals(allAttributes)) return;
+            String editorText = attributeCombo.getEditor().getText();
+            attributeCombo.getItems().setAll(allAttributes);
+            attributeCombo.getEditor().setText(editorText);
             attributeCombo.hide();
         };
-        AttributeSuggestSettings.getInstance().enabledProperty().addListener((obs, wasEnabled, enabled) -> {
-            if (!enabled) showFullAttributeList.run();
-        });
+        ChangeListener<Boolean> suggestListener = (obs, wasEnabled, enabled) -> {
+            if (!enabled) {
+                restoreFullAttributeList.run();
+                attributeCombo.hide();
+            }
+        };
+        var suggestSettings = AttributeSuggestSettings.getInstance();
+        suggestSettings.enabledProperty().addListener(suggestListener);
+        setOnHidden(e -> suggestSettings.enabledProperty().removeListener(suggestListener));
 
         // Filter as user types
         attributeCombo.getEditor().textProperty().addListener((obs, oldVal, newVal) -> {
             if (!AttributeSuggestSettings.getInstance().isEnabled()) {
-                showFullAttributeList.run();
+                restoreFullAttributeList.run();
                 return;
             }
             if (newVal == null || newVal.isEmpty()) {
