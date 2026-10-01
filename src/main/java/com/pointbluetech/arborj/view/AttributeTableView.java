@@ -3,6 +3,7 @@ package com.pointbluetech.arborj.view;
 import com.pointbluetech.arborj.controller.MainController;
 import com.pointbluetech.arborj.controller.MainController.AttributeRow;
 import com.pointbluetech.arborj.model.LDAPAttributeSyntax;
+import com.pointbluetech.arborj.service.AttributeSuggestSettings;
 import com.pointbluetech.arborj.service.FontSettings;
 import javafx.beans.property.SimpleStringProperty;
 import javafx.collections.transformation.FilteredList;
@@ -927,6 +928,7 @@ public class AttributeTableView {
         ContextMenu suggestions = new ContextMenu();
         field.textProperty().addListener((obs, oldVal, newVal) -> {
             suggestions.hide();
+            if (!AttributeSuggestSettings.getInstance().isEnabled()) return;
             if (newVal == null || newVal.length() < 2) return;
             var attrMap = controller.getSchemaService().getAttributeMap();
             if (attrMap == null) return;

@@ -1,6 +1,7 @@
 package com.pointbluetech.arborj.view.edir;
 
 import com.pointbluetech.arborj.controller.MainController;
+import com.pointbluetech.arborj.service.AttributeSuggestSettings;
 import com.pointbluetech.arborj.model.EffectiveRights;
 import com.pointbluetech.arborj.model.EffectiveRights.AttributeRight;
 import com.pointbluetech.arborj.model.EffectiveRights.EntryRight;
@@ -104,6 +105,9 @@ public class EffectiveRightsView extends Dialog<Void> {
 
         // Filter as user types
         attributeCombo.getEditor().textProperty().addListener((obs, oldVal, newVal) -> {
+            if (!AttributeSuggestSettings.getInstance().isEnabled()) {
+                return;
+            }
             if (newVal == null || newVal.isEmpty()) {
                 if (attrMap != null) {
                     attributeCombo.getItems().setAll(attrMap.keySet().stream().sorted().toList());

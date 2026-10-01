@@ -41,10 +41,13 @@ public class LDAPFilterValidator {
 
     /**
      * Extract the attribute name token at the given cursor position.
-     * Used for autocomplete — returns the partial attribute name being typed.
+     * Used for autocomplete — returns the partial attribute name being typed,
+     * or null when the caret is on the value side of an assertion (after {@code =}),
+     * including DN components inside that value.
      */
     public static String attributeTokenAt(int cursor, String filter) {
         if (filter == null || cursor <= 0 || cursor > filter.length()) return null;
+        if (isOnAssertionValueSide(filter, cursor)) return null;
         char[] chars = filter.toCharArray();
         // Walk left from cursor to find start of identifier
         int start = cursor - 1;
@@ -54,7 +57,26 @@ public class LDAPFilterValidator {
         while (end + 1 < chars.length && isAttrChar(chars[end + 1])) end++;
         if (start > end) return null;
         String token = filter.substring(start, end + 1);
-        return token.isEmpty() ? null : token;
+        if (token.isEmpty()) return null;
+        for (int i = 0; i < token.length(); i++) {
+            if (!isAttrChar(token.charAt(i))) return null;
+        }
+        return token;
+    }
+
+    /**
+     * True when {@code cursor} is past the assertion operator of the filter
+     * item that contains it ({@code =}, {@code ~=}, {@code >=}, {@code <=},
+     * {@code :=}). Scanning left, an {@code =} before {@code (} or {@code )}
+     * means the caret is in the value.
+     */
+    private static boolean isOnAssertionValueSide(String filter, int cursor) {
+        for (int i = Math.min(cursor, filter.length()) - 1; i >= 0; i--) {
+            char c = filter.charAt(i);
+            if (c == '(' || c == ')') return false;
+            if (c == '=') return true;
+        }
+        return false;
     }
 
     private static boolean isAttrChar(char c) {
