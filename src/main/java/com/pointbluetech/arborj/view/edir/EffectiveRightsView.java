@@ -98,19 +98,36 @@ public class EffectiveRightsView extends Dialog<Void> {
 
         // Populate from schema
         var attrMap = controller.getSchemaService().getAttributeMap();
-        if (attrMap != null && !attrMap.isEmpty()) {
-            List<String> sorted = attrMap.keySet().stream().sorted().toList();
-            attributeCombo.setItems(FXCollections.observableArrayList(sorted));
+        List<String> allAttributes = (attrMap == null || attrMap.isEmpty())
+                ? List.of()
+                : attrMap.keySet().stream().sorted().toList();
+        if (!allAttributes.isEmpty()) {
+            attributeCombo.setItems(FXCollections.observableArrayList(allAttributes));
         }
+
+        // Suggestions off: full schema list, dropdown closed. Also runs when the
+        // preference flips off while this dialog is open.
+        Runnable showFullAttributeList = () -> {
+            if (!allAttributes.isEmpty() && !attributeCombo.getItems().equals(allAttributes)) {
+                String editorText = attributeCombo.getEditor().getText();
+                attributeCombo.getItems().setAll(allAttributes);
+                attributeCombo.getEditor().setText(editorText);
+            }
+            attributeCombo.hide();
+        };
+        AttributeSuggestSettings.getInstance().enabledProperty().addListener((obs, wasEnabled, enabled) -> {
+            if (!enabled) showFullAttributeList.run();
+        });
 
         // Filter as user types
         attributeCombo.getEditor().textProperty().addListener((obs, oldVal, newVal) -> {
             if (!AttributeSuggestSettings.getInstance().isEnabled()) {
+                showFullAttributeList.run();
                 return;
             }
             if (newVal == null || newVal.isEmpty()) {
-                if (attrMap != null) {
-                    attributeCombo.getItems().setAll(attrMap.keySet().stream().sorted().toList());
+                if (!allAttributes.isEmpty()) {
+                    attributeCombo.getItems().setAll(allAttributes);
                 }
                 return;
             }
