@@ -596,7 +596,9 @@ public class MainView {
         javafx.stage.Popup autoPopup = new javafx.stage.Popup();
         searchSuggestionPopup = autoPopup;
         autoPopup.setAutoHide(true);
-        autoPopup.setHideOnEscape(true);
+        // Default is true, which hides the popup without arming the guard.
+        // Esc is handled only by the explicit dismiss path.
+        autoPopup.setHideOnEscape(false);
         autoPopup.getContent().add(autoComplete);
 
         Runnable showAutoComplete = () -> {
