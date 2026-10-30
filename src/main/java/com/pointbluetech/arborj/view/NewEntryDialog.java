@@ -2,6 +2,7 @@ package com.pointbluetech.arborj.view;
 
 import com.pointbluetech.arborj.controller.MainController;
 import com.pointbluetech.arborj.model.LDAPObjectClassInfo;
+import com.unboundid.ldap.sdk.RDN;
 import javafx.collections.FXCollections;
 import javafx.collections.ObservableList;
 import javafx.collections.transformation.FilteredList;
@@ -12,6 +13,7 @@ import javafx.scene.layout.*;
 import javafx.scene.text.Font;
 
 import java.util.*;
+import java.util.regex.Pattern;
 
 /**
  * Two-step wizard dialog for creating a new LDAP entry.
@@ -50,6 +52,11 @@ public class NewEntryDialog extends Dialog<Void> {
     private final Button createButton = new Button("Create");
 
     private int currentStep = 1;
+
+    /** RFC 4512 descr: ALPHA *( ALPHA / DIGIT / HYPHEN ). */
+    private static final Pattern ATTR_DESCR = Pattern.compile("[A-Za-z][A-Za-z0-9-]*");
+    /** RFC 4512 numericoid: number *( DOT number ). */
+    private static final Pattern ATTR_OID = Pattern.compile("[0-9]+(?:\\.[0-9]+)*");
 
     public NewEntryDialog(MainController controller, String parentDN) {
         this(controller, parentDN, null);
@@ -228,10 +235,9 @@ public class NewEntryDialog extends Dialog<Void> {
         mustAttrsByLower.remove("objectclass");
         Collection<String> mustAttrs = mustAttrsByLower.values();
 
-        // Parse RDN attribute name and value
-        String rdnAttr = rdnAttrCombo.getValue();
-        String rdnValue = rdnField.getText().trim();
-        if (rdnAttr == null || rdnAttr.isBlank()) rdnAttr = "cn";
+        // Prefill the RDN attribute from the (unescaped) RDN field value
+        String rdnAttr = resolvedRdnAttr();
+        String rdnValue = rdnField.getText() == null ? "" : rdnField.getText();
 
         Font mono = Font.font("monospaced", 12);
         int row = 0;
@@ -243,9 +249,11 @@ public class NewEntryDialog extends Dialog<Void> {
             TextField field = new TextField();
             field.setFont(mono);
 
-            // Pre-populate the RDN attribute
+            // Prefill the RDN attribute from Step 1 and keep it read-only so
+            // the Add cannot disagree with the DN (Arbor does the same).
             if (attr.equalsIgnoreCase(rdnAttr)) {
                 field.setText(rdnValue != null ? rdnValue : "");
+                field.setEditable(false);
             }
 
             attributeGrid.add(label, 0, row);
@@ -303,42 +311,73 @@ public class NewEntryDialog extends Dialog<Void> {
         Map<String, LDAPObjectClassInfo> ocMap = controller.getSchemaService().getObjectClassMap();
         if (ocMap == null) return;
 
-        Set<String> namingAttrs = new LinkedHashSet<>();
+        List<LDAPObjectClassInfo> selected = new ArrayList<>();
         for (String ocName : selectedClasses) {
-            LDAPObjectClassInfo info = ocMap.get(ocName);
-            if (info != null && info.getNamingAttributes() != null) {
-                namingAttrs.addAll(info.getNamingAttributes());
-            }
+            selected.add(ocMap.get(ocName));
         }
-
-        // Fallback: common naming attributes
-        if (namingAttrs.isEmpty()) {
-            namingAttrs.addAll(List.of("cn", "ou", "o", "c", "dc", "uid"));
-        }
+        List<String> namingAttrs = namingAttributeChoices(selected);
 
         String current = combo.getValue();
         combo.getItems().setAll(namingAttrs);
         if (current != null && namingAttrs.contains(current)) {
             combo.setValue(current);
         } else if (!namingAttrs.isEmpty()) {
-            combo.setValue(namingAttrs.iterator().next());
+            combo.setValue(namingAttrs.getFirst());
         }
     }
 
     private String getRDN() {
-        String attr = rdnAttrCombo.getValue();
-        String value = rdnField.getText().trim();
-        if (attr == null || attr.isBlank()) attr = "cn";
-        return attr + "=" + value;
+        return formatRDN(resolvedRdnAttr(), rdnField.getText());
+    }
+
+    /**
+     * Editor text is the source of truth for the editable RDN combo:
+     * {@link ComboBox#getValue()} can lag typed text until Enter or focus loss.
+     */
+    private String resolvedRdnAttr() {
+        String editorText = null;
+        if (rdnAttrCombo != null && rdnAttrCombo.isEditable()) {
+            TextField editor = rdnAttrCombo.getEditor();
+            if (editor != null) editorText = editor.getText();
+        }
+        String value = rdnAttrCombo == null ? null : rdnAttrCombo.getValue();
+        String resolved = resolveComboText(editorText, value);
+        return resolved.isEmpty() ? "cn" : resolved;
+    }
+
+    /**
+     * Prefers trimmed editor text over a stale committed combo value.
+     * Returns empty when both are blank (callers default to {@code cn}).
+     */
+    static String resolveComboText(String editorText, String value) {
+        if (editorText != null) {
+            String trimmed = editorText.trim();
+            if (!trimmed.isEmpty()) return trimmed;
+        }
+        if (value != null) {
+            String trimmed = value.trim();
+            if (!trimmed.isEmpty()) return trimmed;
+        }
+        return "";
     }
 
     private boolean validateStep1() {
-        String value = rdnField.getText().trim();
+        String value = rdnField.getText() == null ? "" : rdnField.getText().trim();
         if (value.isEmpty()) {
             showAlert(Alert.AlertType.WARNING, "Validation",
                     "Please enter an RDN value.");
             return false;
         }
+        rdnField.setText(value);
+
+        String attr = resolvedRdnAttr();
+        if (!isValidAttributeType(attr)) {
+            showAlert(Alert.AlertType.WARNING, "Validation",
+                    "RDN attribute must be an LDAP name such as cn, or a numeric OID such as 2.5.4.3.");
+            return false;
+        }
+        rdnAttrCombo.setValue(attr);
+
         if (selectedClasses.isEmpty()) {
             showAlert(Alert.AlertType.WARNING, "Validation",
                     "Please select at least one objectClass.");
@@ -350,6 +389,8 @@ public class NewEntryDialog extends Dialog<Void> {
     // ---- Create entry ----
 
     private void doCreate() {
+        String rdnAttr = resolvedRdnAttr();
+        String rdnValue = rdnField.getText() == null ? "" : rdnField.getText();
         String rdn = getRDN();
 
         // Validate required fields are filled
@@ -363,19 +404,91 @@ public class NewEntryDialog extends Dialog<Void> {
             }
         }
 
-        // Build attribute map
-        Map<String, List<String>> attributes = new LinkedHashMap<>();
+        Map<String, String> fieldValues = new LinkedHashMap<>();
         for (var entry : attributeFields.entrySet()) {
-            String value = entry.getValue().getText().trim();
-            if (!value.isEmpty()) {
-                attributes.put(entry.getKey(), List.of(value));
-            }
+            fieldValues.put(entry.getKey(), entry.getValue().getText());
         }
+
+        Map<String, List<String>> attributes = buildCreateAttributes(fieldValues, rdnAttr, rdnValue);
 
         List<String> objectClasses = new ArrayList<>(selectedClasses);
 
         controller.createEntry(parentDN, rdn, objectClasses, attributes);
         close();
+    }
+
+    /**
+     * Builds {@code attributeType=} plus an RFC 4514-escaped value. The RDN
+     * text field is the unescaped attribute value; {@code +} is escaped as
+     * part of that value (multi-valued RDNs are not supported).
+     */
+    static String formatRDN(String attr, String unescapedValue) {
+        if (attr == null || attr.isBlank()) attr = "cn";
+        else attr = attr.trim();
+        String value = unescapedValue == null ? "" : unescapedValue.trim();
+        return new RDN(attr, value).toString();
+    }
+
+    /**
+     * Builds the LDAP Add attribute map from MUST field values plus the RDN.
+     * The RDN attribute is always included even when it is MAY (not a MUST
+     * field) — Active Directory requires the naming attribute on Add.
+     * The Add value is the unescaped RDN text (not the DN-escaped form).
+     * If the RDN attribute is already a MUST field, the RDN value wins so
+     * the Add cannot disagree with the DN.
+     */
+    static Map<String, List<String>> buildCreateAttributes(Map<String, String> fieldValues,
+                                                           String rdnAttr, String rdnValue) {
+        String attr = (rdnAttr == null || rdnAttr.isBlank()) ? "cn" : rdnAttr.trim();
+        String value = rdnValue == null ? "" : rdnValue.trim();
+
+        Map<String, List<String>> attributes = new LinkedHashMap<>();
+        if (fieldValues != null) {
+            for (var entry : fieldValues.entrySet()) {
+                if (entry.getKey() == null || entry.getKey().isBlank()) continue;
+                if (entry.getKey().equalsIgnoreCase(attr)) continue;
+                String fieldValue = entry.getValue() == null ? "" : entry.getValue().trim();
+                if (!fieldValue.isEmpty()) {
+                    attributes.put(entry.getKey(), List.of(fieldValue));
+                }
+            }
+        }
+
+        if (!value.isBlank()) {
+            attributes.put(attr, List.of(value));
+        }
+        return attributes;
+    }
+
+    /**
+     * True for an RFC 4512 attribute descr ({@code cn}, {@code telephoneNumber})
+     * or a numeric OID ({@code 2.5.4.3}).
+     */
+    static boolean isValidAttributeType(String attr) {
+        if (attr == null || attr.isBlank()) return false;
+        String trimmed = attr.trim();
+        return ATTR_DESCR.matcher(trimmed).matches() || ATTR_OID.matcher(trimmed).matches();
+    }
+
+    /**
+     * RDN combo choices for the selected objectClasses: schema naming
+     * attributes (X-NDS_NAMING / AD rDNAttID) in encounter order — so the
+     * class's naming attribute is first — then the conventional cn/ou/o/c/dc/uid
+     * fallback when the schema has none.
+     */
+    static List<String> namingAttributeChoices(Iterable<LDAPObjectClassInfo> selectedClassInfos) {
+        Set<String> namingAttrs = new LinkedHashSet<>();
+        if (selectedClassInfos != null) {
+            for (LDAPObjectClassInfo info : selectedClassInfos) {
+                if (info != null && info.getNamingAttributes() != null) {
+                    namingAttrs.addAll(info.getNamingAttributes());
+                }
+            }
+        }
+        if (namingAttrs.isEmpty()) {
+            namingAttrs.addAll(List.of("cn", "ou", "o", "c", "dc", "uid"));
+        }
+        return new ArrayList<>(namingAttrs);
     }
 
     private void showAlert(Alert.AlertType type, String title, String message) {
