@@ -12,7 +12,7 @@ import java.util.prefs.Preferences;
 
 public class ArborJApp extends Application {
 
-    public static final String APP_VERSION = "2.0.8";
+    public static final String APP_VERSION = "2.0.9";
 
     private static final String PREF_THEME = "theme";
     private static final Preferences prefs = Preferences.userNodeForPackage(ArborJApp.class);

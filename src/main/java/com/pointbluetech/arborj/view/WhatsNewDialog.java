@@ -71,6 +71,21 @@ public class WhatsNewDialog {
         features.setPadding(new Insets(8, 0, 8, 0));
 
         features.getChildren().addAll(
+                featureItem("New Entry Names Work for Every Class",
+                        "The naming-attribute list in New Entry now offers every valid "
+                        + "choice for the classes you pick, including inherited ones such "
+                        + "as cn for Active Directory groups, and puts Active Directory's "
+                        + "preferred naming attribute first. The naming value is always "
+                        + "sent when the entry is created, so creates no longer fail "
+                        + "because it was missing, and special characters in the name "
+                        + "are escaped correctly in the DN."),
+
+                featureItem("Search Filter Suggestions No Longer Trap the Keyboard",
+                        "Attribute-name suggestions in the search filter field stay out "
+                        + "of the way after you type =, close with Esc, and no longer "
+                        + "steal keyboard focus. The Effective Rights attribute list also "
+                        + "stays complete and open while you type."),
+
                 featureItem("eDirectory Partitions Browse Correctly",
                         "Containers that are also partition roots — the top of the tree, "
                         + "IDM driver sets, partitioned OUs — now open and show their "
