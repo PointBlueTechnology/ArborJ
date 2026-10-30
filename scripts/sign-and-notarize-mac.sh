@@ -28,6 +28,12 @@ SIGNED_DMG="target/installer/${APP_NAME}-${VERSION}-signed.dmg"
 : "${DEVELOPER_ID_APP:?Set DEVELOPER_ID_APP to your 'Developer ID Application: Name (TEAMID)' identity}"
 NOTARIZE_KEYCHAIN="${NOTARIZE_KEYCHAIN:-notarytool-arborj}"
 
+# Hardened-runtime entitlements required by the JVM (JIT). Without these the
+# launcher crashes at startup in pthread_jit_write_protect_np.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENTITLEMENTS="$SCRIPT_DIR/macos/arborj.entitlements"
+[[ -f "$ENTITLEMENTS" ]] || { echo "Missing entitlements file: $ENTITLEMENTS" >&2; exit 1; }
+
 SKIP_NOTARIZE=false
 if [[ "${1:-}" == "--skip-notarize" ]]; then
     SKIP_NOTARIZE=true
@@ -74,6 +80,7 @@ if [[ -d "$APP_DIR" ]]; then
         if file "$bin" | grep -q "Mach-O"; then
             echo "  Signing: $(basename "$bin")"
             codesign --force --timestamp --options runtime \
+                --entitlements "$ENTITLEMENTS" \
                 --sign "$DEVELOPER_ID_APP" "$bin"
         fi
     done
@@ -82,6 +89,7 @@ if [[ -d "$APP_DIR" ]]; then
     find "$APP_DIR/Contents/MacOS" -type f | while read -r f; do
         echo "  Signing: MacOS/$(basename "$f")"
         codesign --force --timestamp --options runtime \
+            --entitlements "$ENTITLEMENTS" \
             --sign "$DEVELOPER_ID_APP" "$f"
     done
 
@@ -96,6 +104,7 @@ if [[ -d "$APP_DIR" ]]; then
     # Sign the overall app bundle last
     echo "  Signing app bundle..."
     codesign --force --timestamp --options runtime \
+        --entitlements "$ENTITLEMENTS" \
         --sign "$DEVELOPER_ID_APP" "$APP_DIR"
 
     echo "  Verifying signature..."
