@@ -201,6 +201,29 @@ class NewEntryDialogTest {
     }
 
     @Test
+    @DisplayName("typed combo editor text wins over a stale committed value")
+    void resolveComboTextPrefersEditor() {
+        assertEquals("ou", NewEntryDialog.resolveComboText("ou", "cn"));
+        assertEquals("ou", NewEntryDialog.resolveComboText("  ou  ", "cn"));
+        assertEquals("cn", NewEntryDialog.resolveComboText("", "cn"));
+        assertEquals("cn", NewEntryDialog.resolveComboText("  ", "cn"));
+        assertEquals("cn", NewEntryDialog.resolveComboText(null, "cn"));
+        assertEquals("", NewEntryDialog.resolveComboText(null, null));
+        assertEquals("", NewEntryDialog.resolveComboText("", "  "));
+    }
+
+    @Test
+    @DisplayName("typed ou with stale cn value produces ou DN and Add, not cn")
+    void typedEditorAttrUsedForDnAndAdd() {
+        String attr = NewEntryDialog.resolveComboText("ou", "cn");
+        assertEquals("ou=Sales", NewEntryDialog.formatRDN(attr, "Sales"));
+        Map<String, List<String>> attrs =
+                NewEntryDialog.buildCreateAttributes(Map.of(), attr, "Sales");
+        assertEquals(List.of("Sales"), attrs.get("ou"));
+        assertFalse(attrs.containsKey("cn"));
+    }
+
+    @Test
     @DisplayName("attribute type accepts LDAP descr and numeric OID")
     void validAttributeTypes() {
         assertTrue(NewEntryDialog.isValidAttributeType("cn"));

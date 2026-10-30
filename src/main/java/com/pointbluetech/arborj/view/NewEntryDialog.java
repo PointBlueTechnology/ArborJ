@@ -236,9 +236,8 @@ public class NewEntryDialog extends Dialog<Void> {
         Collection<String> mustAttrs = mustAttrsByLower.values();
 
         // Prefill the RDN attribute from the (unescaped) RDN field value
-        String rdnAttr = rdnAttrCombo.getValue();
+        String rdnAttr = resolvedRdnAttr();
         String rdnValue = rdnField.getText() == null ? "" : rdnField.getText();
-        if (rdnAttr == null || rdnAttr.isBlank()) rdnAttr = "cn";
 
         Font mono = Font.font("monospaced", 12);
         int row = 0;
@@ -328,7 +327,38 @@ public class NewEntryDialog extends Dialog<Void> {
     }
 
     private String getRDN() {
-        return formatRDN(rdnAttrCombo.getValue(), rdnField.getText());
+        return formatRDN(resolvedRdnAttr(), rdnField.getText());
+    }
+
+    /**
+     * Editor text is the source of truth for the editable RDN combo:
+     * {@link ComboBox#getValue()} can lag typed text until Enter or focus loss.
+     */
+    private String resolvedRdnAttr() {
+        String editorText = null;
+        if (rdnAttrCombo != null && rdnAttrCombo.isEditable()) {
+            TextField editor = rdnAttrCombo.getEditor();
+            if (editor != null) editorText = editor.getText();
+        }
+        String value = rdnAttrCombo == null ? null : rdnAttrCombo.getValue();
+        String resolved = resolveComboText(editorText, value);
+        return resolved.isEmpty() ? "cn" : resolved;
+    }
+
+    /**
+     * Prefers trimmed editor text over a stale committed combo value.
+     * Returns empty when both are blank (callers default to {@code cn}).
+     */
+    static String resolveComboText(String editorText, String value) {
+        if (editorText != null) {
+            String trimmed = editorText.trim();
+            if (!trimmed.isEmpty()) return trimmed;
+        }
+        if (value != null) {
+            String trimmed = value.trim();
+            if (!trimmed.isEmpty()) return trimmed;
+        }
+        return "";
     }
 
     private boolean validateStep1() {
@@ -340,18 +370,13 @@ public class NewEntryDialog extends Dialog<Void> {
         }
         rdnField.setText(value);
 
-        String attr = rdnAttrCombo.getValue();
-        if (attr == null || attr.isBlank()) {
-            rdnAttrCombo.setValue("cn");
-        } else {
-            attr = attr.trim();
-            if (!isValidAttributeType(attr)) {
-                showAlert(Alert.AlertType.WARNING, "Validation",
-                        "RDN attribute must be an LDAP name such as cn, or a numeric OID such as 2.5.4.3.");
-                return false;
-            }
-            rdnAttrCombo.setValue(attr);
+        String attr = resolvedRdnAttr();
+        if (!isValidAttributeType(attr)) {
+            showAlert(Alert.AlertType.WARNING, "Validation",
+                    "RDN attribute must be an LDAP name such as cn, or a numeric OID such as 2.5.4.3.");
+            return false;
         }
+        rdnAttrCombo.setValue(attr);
 
         if (selectedClasses.isEmpty()) {
             showAlert(Alert.AlertType.WARNING, "Validation",
@@ -364,7 +389,7 @@ public class NewEntryDialog extends Dialog<Void> {
     // ---- Create entry ----
 
     private void doCreate() {
-        String rdnAttr = rdnAttrCombo.getValue();
+        String rdnAttr = resolvedRdnAttr();
         String rdnValue = rdnField.getText() == null ? "" : rdnField.getText();
         String rdn = getRDN();
 
