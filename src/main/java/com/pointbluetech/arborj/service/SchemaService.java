@@ -38,6 +38,8 @@ public class SchemaService {
     private Set<String> containerClasses;
     private Map<String, LDAPAttributeInfo> attributeMap;
     private Map<String, LDAPObjectClassInfo> objectClassMap;
+    /** lDAPDisplayName (lower) → rDNAttID (lower) from AD classSchema. Empty when not AD. */
+    private Map<String, String> adRdnAttIds = Map.of();
 
     public SchemaService(LDAPService ldapService) {
         this.ldapService = ldapService;
@@ -103,9 +105,11 @@ public class SchemaService {
         }
         // Fetch subschema ONCE and reuse for all loading
         var schema = fetchSubschema();
+        adRdnAttIds = Map.of();
         containerClasses = loadContainerClasses(schema);
         attributeMap = loadAttributeMap(schema);
         objectClassMap = loadObjectClassMap(schema);
+        applyRDNAttIDs(objectClassMap, adRdnAttIds);
     }
 
     public Set<String> getContainerClasses() {
@@ -168,11 +172,13 @@ public class SchemaService {
         String schemaDN = firstValue(rootDSE, "schemaNamingContext");
         if (schemaDN == null) return;
 
-        // Search for all classSchema objects with possSuperiors
+        // Search for all classSchema objects with possSuperiors and rDNAttID
         List<LDAPEntry> classSchemas = ldapService.search(schemaDN,
                 com.pointbluetech.arborj.model.SearchScope.SUBTREE,
                 "(objectClass=classSchema)",
-                "lDAPDisplayName", "possSuperiors", "systemPossSuperiors");
+                "lDAPDisplayName", "possSuperiors", "systemPossSuperiors", "rDNAttID");
+
+        adRdnAttIds = collectRDNAttIDs(classSchemas);
 
         // Any class that appears as a possSuperior is a container
         for (LDAPEntry entry : classSchemas) {
@@ -404,6 +410,101 @@ public class SchemaService {
             current = supMap.get(current);
         }
         return null;
+    }
+
+    /**
+     * Reads AD classSchema rDNAttID values. Keys and values are lowercased.
+     * OID-looking values are skipped so the combo is not filled with
+     * {@code 2.5.4.3} when the server does not return the LDAP display name.
+     */
+    static Map<String, String> collectRDNAttIDs(List<LDAPEntry> classSchemas) {
+        Map<String, String> result = new LinkedHashMap<>();
+        if (classSchemas == null) return result;
+        for (LDAPEntry entry : classSchemas) {
+            if (entry == null) continue;
+            String name = entry.getFirstValue("lDAPDisplayName");
+            String rdn = entry.getFirstValue("rDNAttID");
+            if (name == null || name.isBlank() || rdn == null || rdn.isBlank()) continue;
+            String trimmed = rdn.trim();
+            if (looksLikeOid(trimmed)) continue;
+            result.put(name.trim().toLowerCase(Locale.ROOT), trimmed.toLowerCase(Locale.ROOT));
+        }
+        return result;
+    }
+
+    /**
+     * Sets each class's naming attribute from AD rDNAttID (direct or inherited
+     * via SUP), putting it first alongside any existing X-NDS_NAMING list.
+     */
+    static void applyRDNAttIDs(Map<String, LDAPObjectClassInfo> objectClassMap,
+                               Map<String, String> rdnAttIds) {
+        if (objectClassMap == null || objectClassMap.isEmpty()
+                || rdnAttIds == null || rdnAttIds.isEmpty()) {
+            return;
+        }
+        for (String className : new ArrayList<>(objectClassMap.keySet())) {
+            LDAPObjectClassInfo info = objectClassMap.get(className);
+            if (info == null) continue;
+            String rdn = resolveRDNAttID(className, objectClassMap, rdnAttIds, new HashSet<>());
+            if (rdn == null || rdn.isBlank()) continue;
+            List<String> naming = mergeNamingAttribute(info.getNamingAttributes(), rdn);
+            if (namingEquals(info.getNamingAttributes(), naming)) continue;
+            objectClassMap.put(className, new LDAPObjectClassInfo(
+                    info.getName(),
+                    info.getMustAttributes(),
+                    info.getMayAttributes(),
+                    info.getSuperClass(),
+                    naming
+            ));
+        }
+    }
+
+    private static String resolveRDNAttID(String className,
+                                          Map<String, LDAPObjectClassInfo> objectClassMap,
+                                          Map<String, String> rdnAttIds,
+                                          Set<String> visited) {
+        String current = className;
+        while (current != null) {
+            String key = current.toLowerCase(Locale.ROOT);
+            if (!visited.add(key)) break;
+            String rdn = rdnAttIds.get(key);
+            if (rdn != null && !rdn.isBlank()) return rdn;
+            LDAPObjectClassInfo info = objectClassMap.get(key);
+            current = info != null ? info.getSuperClass() : null;
+        }
+        return null;
+    }
+
+    private static List<String> mergeNamingAttribute(List<String> existing, String rdnAttId) {
+        Map<String, String> merged = new LinkedHashMap<>();
+        merged.put(rdnAttId.toLowerCase(Locale.ROOT), rdnAttId);
+        if (existing != null) {
+            for (String name : existing) {
+                if (name == null || name.isBlank()) continue;
+                merged.putIfAbsent(name.toLowerCase(Locale.ROOT), name);
+            }
+        }
+        return new ArrayList<>(merged.values());
+    }
+
+    private static boolean namingEquals(List<String> a, List<String> b) {
+        if (a == b) return true;
+        if (a == null || b == null) return false;
+        return a.equals(b);
+    }
+
+    /** True for values like {@code 2.5.4.3} (digits and dots only, with at least one of each). */
+    static boolean looksLikeOid(String value) {
+        if (value == null || value.isEmpty()) return false;
+        boolean hasDigit = false;
+        boolean hasDot = false;
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (c >= '0' && c <= '9') hasDigit = true;
+            else if (c == '.') hasDot = true;
+            else return false;
+        }
+        return hasDigit && hasDot;
     }
 
     private static String firstValue(Map<String, List<String>> attrs, String key) {

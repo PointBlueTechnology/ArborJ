@@ -303,25 +303,18 @@ public class NewEntryDialog extends Dialog<Void> {
         Map<String, LDAPObjectClassInfo> ocMap = controller.getSchemaService().getObjectClassMap();
         if (ocMap == null) return;
 
-        Set<String> namingAttrs = new LinkedHashSet<>();
+        List<LDAPObjectClassInfo> selected = new ArrayList<>();
         for (String ocName : selectedClasses) {
-            LDAPObjectClassInfo info = ocMap.get(ocName);
-            if (info != null && info.getNamingAttributes() != null) {
-                namingAttrs.addAll(info.getNamingAttributes());
-            }
+            selected.add(ocMap.get(ocName));
         }
-
-        // Fallback: common naming attributes
-        if (namingAttrs.isEmpty()) {
-            namingAttrs.addAll(List.of("cn", "ou", "o", "c", "dc", "uid"));
-        }
+        List<String> namingAttrs = namingAttributeChoices(selected);
 
         String current = combo.getValue();
         combo.getItems().setAll(namingAttrs);
         if (current != null && namingAttrs.contains(current)) {
             combo.setValue(current);
         } else if (!namingAttrs.isEmpty()) {
-            combo.setValue(namingAttrs.iterator().next());
+            combo.setValue(namingAttrs.getFirst());
         }
     }
 
@@ -363,19 +356,75 @@ public class NewEntryDialog extends Dialog<Void> {
             }
         }
 
-        // Build attribute map
-        Map<String, List<String>> attributes = new LinkedHashMap<>();
+        Map<String, String> fieldValues = new LinkedHashMap<>();
         for (var entry : attributeFields.entrySet()) {
-            String value = entry.getValue().getText().trim();
-            if (!value.isEmpty()) {
-                attributes.put(entry.getKey(), List.of(value));
-            }
+            fieldValues.put(entry.getKey(), entry.getValue().getText());
         }
+
+        String rdnAttr = rdnAttrCombo.getValue();
+        String rdnValue = rdnField.getText();
+        Map<String, List<String>> attributes = buildCreateAttributes(fieldValues, rdnAttr, rdnValue);
 
         List<String> objectClasses = new ArrayList<>(selectedClasses);
 
         controller.createEntry(parentDN, rdn, objectClasses, attributes);
         close();
+    }
+
+    /**
+     * Builds the LDAP Add attribute map from MUST field values plus the RDN.
+     * The RDN attribute is always included even when it is MAY (not a MUST
+     * field) — Active Directory requires the naming attribute on Add.
+     * If the RDN attribute is already present (case-insensitive), the field
+     * value is kept and it is not duplicated.
+     */
+    static Map<String, List<String>> buildCreateAttributes(Map<String, String> fieldValues,
+                                                           String rdnAttr, String rdnValue) {
+        Map<String, List<String>> attributes = new LinkedHashMap<>();
+        if (fieldValues != null) {
+            for (var entry : fieldValues.entrySet()) {
+                if (entry.getKey() == null || entry.getKey().isBlank()) continue;
+                String value = entry.getValue() == null ? "" : entry.getValue().trim();
+                if (!value.isEmpty()) {
+                    attributes.put(entry.getKey(), List.of(value));
+                }
+            }
+        }
+
+        String attr = (rdnAttr == null || rdnAttr.isBlank()) ? "cn" : rdnAttr.trim();
+        String value = rdnValue == null ? "" : rdnValue.trim();
+        if (!value.isEmpty() && !containsAttrIgnoreCase(attributes, attr)) {
+            attributes.put(attr, List.of(value));
+        }
+        return attributes;
+    }
+
+    /**
+     * RDN combo choices for the selected objectClasses: schema naming
+     * attributes (X-NDS_NAMING / AD rDNAttID) in encounter order — so the
+     * class's naming attribute is first — then the conventional cn/ou/o/c/dc/uid
+     * fallback when the schema has none.
+     */
+    static List<String> namingAttributeChoices(Iterable<LDAPObjectClassInfo> selectedClassInfos) {
+        Set<String> namingAttrs = new LinkedHashSet<>();
+        if (selectedClassInfos != null) {
+            for (LDAPObjectClassInfo info : selectedClassInfos) {
+                if (info != null && info.getNamingAttributes() != null) {
+                    namingAttrs.addAll(info.getNamingAttributes());
+                }
+            }
+        }
+        if (namingAttrs.isEmpty()) {
+            namingAttrs.addAll(List.of("cn", "ou", "o", "c", "dc", "uid"));
+        }
+        return new ArrayList<>(namingAttrs);
+    }
+
+    private static boolean containsAttrIgnoreCase(Map<String, ?> attributes, String attr) {
+        for (String key : attributes.keySet()) {
+            if (key.equalsIgnoreCase(attr)) return true;
+        }
+        return false;
     }
 
     private void showAlert(Alert.AlertType type, String title, String message) {
