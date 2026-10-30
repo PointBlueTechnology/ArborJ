@@ -25,7 +25,7 @@ following open-source libraries, each under its own license.
    Copyright: Copyright 2022-2024 mkpaz
 
 4. JavaFX
-   Version: 23.0.2
+   Version: 25.0.5
    License: GNU General Public License v2 with Classpath Exception
    URL: https://openjfx.io
    Copyright: Copyright 2007-2024 Oracle and/or its affiliates
