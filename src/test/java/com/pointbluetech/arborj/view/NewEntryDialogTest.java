@@ -54,21 +54,38 @@ class NewEntryDialogTest {
         Map<String, List<String>> attrs =
                 NewEntryDialog.buildCreateAttributes(fields, "cn", "Alice");
 
-        assertEquals(List.of("Alice"), attrs.get("CN"));
-        assertFalse(attrs.containsKey("cn"));
+        assertEquals(List.of("Alice"), attrs.get("cn"));
+        assertFalse(attrs.containsKey("CN"));
         assertEquals(1, attrs.size());
     }
 
     @Test
-    @DisplayName("create payload keeps the MUST field value when RDN casing differs")
-    void createPayloadKeepsExistingFieldValue() {
+    @DisplayName("create payload uses the RDN value when a MUST field disagrees")
+    void createPayloadRdnValueWinsOverMustField() {
         Map<String, String> fields = new LinkedHashMap<>();
         fields.put("cn", "from-field");
 
         Map<String, List<String>> attrs =
                 NewEntryDialog.buildCreateAttributes(fields, "cn", "from-rdn");
 
-        assertEquals(List.of("from-field"), attrs.get("cn"));
+        assertEquals(List.of("from-rdn"), attrs.get("cn"));
+    }
+
+    @Test
+    @DisplayName("rdnFieldConflict is null when MUST matches RDN or RDN is not MUST")
+    void rdnFieldConflictNone() {
+        assertNull(NewEntryDialog.rdnFieldConflict(Map.of("cn", "Alice"), "cn", "Alice"));
+        assertNull(NewEntryDialog.rdnFieldConflict(Map.of("groupType", "2"), "cn", "gr2"));
+        assertNull(NewEntryDialog.rdnFieldConflict(null, "cn", "gr2"));
+    }
+
+    @Test
+    @DisplayName("rdnFieldConflict returns the MUST field name when it disagrees with the RDN")
+    void rdnFieldConflictWhenDifferent() {
+        assertEquals("cn", NewEntryDialog.rdnFieldConflict(
+                Map.of("cn", "from-field"), "cn", "from-rdn"));
+        assertEquals("CN", NewEntryDialog.rdnFieldConflict(
+                Map.of("CN", "x"), "cn", "y"));
     }
 
     @Test
@@ -160,5 +177,54 @@ class NewEntryDialogTest {
 
         assertEquals(List.of("cn"),
                 NewEntryDialog.namingAttributeChoices(List.of(person, group)));
+    }
+
+    @Test
+    @DisplayName("comma is escaped in the DN and sent raw in the Add")
+    void rdnEscapesComma() {
+        assertEscapedRdn("Smith, John", "cn=Smith\\, John");
+    }
+
+    @Test
+    @DisplayName("plus is escaped as a value character, not a multi-valued RDN")
+    void rdnEscapesPlus() {
+        assertEscapedRdn("Smith+John", "cn=Smith\\+John");
+    }
+
+    @Test
+    @DisplayName("leading space is escaped in the DN and preserved in the Add")
+    void rdnEscapesLeadingSpace() {
+        assertEscapedRdn(" Alice", "cn=\\ Alice");
+    }
+
+    @Test
+    @DisplayName("trailing space is escaped in the DN and preserved in the Add")
+    void rdnEscapesTrailingSpace() {
+        assertEscapedRdn("Alice ", "cn=Alice\\ ");
+    }
+
+    @Test
+    @DisplayName("leading hash is escaped in the DN and sent raw in the Add")
+    void rdnEscapesLeadingHash() {
+        assertEscapedRdn("#hash", "cn=\\#hash");
+    }
+
+    @Test
+    @DisplayName("backslash is escaped in the DN and sent raw in the Add")
+    void rdnEscapesBackslash() {
+        assertEscapedRdn("foo\\bar", "cn=foo\\\\bar");
+    }
+
+    @Test
+    @DisplayName("plain RDN value is not escaped")
+    void rdnPlainValueUnchanged() {
+        assertEscapedRdn("gr2", "cn=gr2");
+    }
+
+    /** DN uses RFC 4514 escapes; Add attributes keep the unescaped field text. */
+    private static void assertEscapedRdn(String raw, String expectedRdn) {
+        assertEquals(expectedRdn, NewEntryDialog.formatRDN("cn", raw));
+        assertEquals(List.of(raw),
+                NewEntryDialog.buildCreateAttributes(Map.of(), "cn", raw).get("cn"));
     }
 }

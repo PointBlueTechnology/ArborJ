@@ -2,6 +2,7 @@ package com.pointbluetech.arborj.view;
 
 import com.pointbluetech.arborj.controller.MainController;
 import com.pointbluetech.arborj.model.LDAPObjectClassInfo;
+import com.unboundid.ldap.sdk.RDN;
 import javafx.collections.FXCollections;
 import javafx.collections.ObservableList;
 import javafx.collections.transformation.FilteredList;
@@ -228,9 +229,9 @@ public class NewEntryDialog extends Dialog<Void> {
         mustAttrsByLower.remove("objectclass");
         Collection<String> mustAttrs = mustAttrsByLower.values();
 
-        // Parse RDN attribute name and value
+        // Prefill the RDN attribute from the (unescaped) RDN field value
         String rdnAttr = rdnAttrCombo.getValue();
-        String rdnValue = rdnField.getText().trim();
+        String rdnValue = rdnField.getText() == null ? "" : rdnField.getText();
         if (rdnAttr == null || rdnAttr.isBlank()) rdnAttr = "cn";
 
         Font mono = Font.font("monospaced", 12);
@@ -319,15 +320,12 @@ public class NewEntryDialog extends Dialog<Void> {
     }
 
     private String getRDN() {
-        String attr = rdnAttrCombo.getValue();
-        String value = rdnField.getText().trim();
-        if (attr == null || attr.isBlank()) attr = "cn";
-        return attr + "=" + value;
+        return formatRDN(rdnAttrCombo.getValue(), rdnField.getText());
     }
 
     private boolean validateStep1() {
-        String value = rdnField.getText().trim();
-        if (value.isEmpty()) {
+        String value = rdnField.getText();
+        if (value == null || value.isBlank()) {
             showAlert(Alert.AlertType.WARNING, "Validation",
                     "Please enter an RDN value.");
             return false;
@@ -343,6 +341,8 @@ public class NewEntryDialog extends Dialog<Void> {
     // ---- Create entry ----
 
     private void doCreate() {
+        String rdnAttr = rdnAttrCombo.getValue();
+        String rdnValue = rdnField.getText() == null ? "" : rdnField.getText();
         String rdn = getRDN();
 
         // Validate required fields are filled
@@ -361,8 +361,15 @@ public class NewEntryDialog extends Dialog<Void> {
             fieldValues.put(entry.getKey(), entry.getValue().getText());
         }
 
-        String rdnAttr = rdnAttrCombo.getValue();
-        String rdnValue = rdnField.getText();
+        String conflict = rdnFieldConflict(fieldValues, rdnAttr, rdnValue);
+        if (conflict != null) {
+            showAlert(Alert.AlertType.WARNING, "Validation",
+                    "Required attribute '" + conflict + "' must match the RDN value.");
+            TextField field = attributeFields.get(conflict);
+            if (field != null) field.requestFocus();
+            return;
+        }
+
         Map<String, List<String>> attributes = buildCreateAttributes(fieldValues, rdnAttr, rdnValue);
 
         List<String> objectClasses = new ArrayList<>(selectedClasses);
@@ -372,31 +379,62 @@ public class NewEntryDialog extends Dialog<Void> {
     }
 
     /**
+     * Builds {@code attributeType=} plus an RFC 4514-escaped value. The RDN
+     * text field is the unescaped attribute value; {@code +} is escaped as
+     * part of that value (multi-valued RDNs are not supported).
+     */
+    static String formatRDN(String attr, String unescapedValue) {
+        if (attr == null || attr.isBlank()) attr = "cn";
+        else attr = attr.trim();
+        String value = unescapedValue == null ? "" : unescapedValue;
+        return new RDN(attr, value).toString();
+    }
+
+    /**
      * Builds the LDAP Add attribute map from MUST field values plus the RDN.
      * The RDN attribute is always included even when it is MAY (not a MUST
      * field) — Active Directory requires the naming attribute on Add.
-     * If the RDN attribute is already present (case-insensitive), the field
-     * value is kept and it is not duplicated.
+     * The Add value is the unescaped RDN text (not the DN-escaped form).
+     * If the RDN attribute is already a MUST field, the RDN value wins so
+     * the Add cannot disagree with the DN.
      */
     static Map<String, List<String>> buildCreateAttributes(Map<String, String> fieldValues,
                                                            String rdnAttr, String rdnValue) {
+        String attr = (rdnAttr == null || rdnAttr.isBlank()) ? "cn" : rdnAttr.trim();
+        String value = rdnValue == null ? "" : rdnValue;
+
         Map<String, List<String>> attributes = new LinkedHashMap<>();
         if (fieldValues != null) {
             for (var entry : fieldValues.entrySet()) {
                 if (entry.getKey() == null || entry.getKey().isBlank()) continue;
-                String value = entry.getValue() == null ? "" : entry.getValue().trim();
-                if (!value.isEmpty()) {
-                    attributes.put(entry.getKey(), List.of(value));
+                if (entry.getKey().equalsIgnoreCase(attr)) continue;
+                String fieldValue = entry.getValue() == null ? "" : entry.getValue().trim();
+                if (!fieldValue.isEmpty()) {
+                    attributes.put(entry.getKey(), List.of(fieldValue));
                 }
             }
         }
 
-        String attr = (rdnAttr == null || rdnAttr.isBlank()) ? "cn" : rdnAttr.trim();
-        String value = rdnValue == null ? "" : rdnValue.trim();
-        if (!value.isEmpty() && !containsAttrIgnoreCase(attributes, attr)) {
+        if (!value.isBlank()) {
             attributes.put(attr, List.of(value));
         }
         return attributes;
+    }
+
+    /**
+     * Returns the MUST field name when it is the RDN attribute but holds a
+     * different value, or {@code null} when they agree or the RDN is not a MUST.
+     */
+    static String rdnFieldConflict(Map<String, String> fieldValues, String rdnAttr, String rdnValue) {
+        if (fieldValues == null) return null;
+        String attr = (rdnAttr == null || rdnAttr.isBlank()) ? "cn" : rdnAttr.trim();
+        String expected = rdnValue == null ? "" : rdnValue;
+        for (var entry : fieldValues.entrySet()) {
+            if (entry.getKey() == null || !entry.getKey().equalsIgnoreCase(attr)) continue;
+            String fieldValue = entry.getValue() == null ? "" : entry.getValue();
+            return fieldValue.equals(expected) ? null : entry.getKey();
+        }
+        return null;
     }
 
     /**
@@ -418,13 +456,6 @@ public class NewEntryDialog extends Dialog<Void> {
             namingAttrs.addAll(List.of("cn", "ou", "o", "c", "dc", "uid"));
         }
         return new ArrayList<>(namingAttrs);
-    }
-
-    private static boolean containsAttrIgnoreCase(Map<String, ?> attributes, String attr) {
-        for (String key : attributes.keySet()) {
-            if (key.equalsIgnoreCase(attr)) return true;
-        }
-        return false;
     }
 
     private void showAlert(Alert.AlertType type, String title, String message) {

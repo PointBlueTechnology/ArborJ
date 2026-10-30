@@ -448,7 +448,7 @@ public class SchemaService {
             String rdn = resolveRDNAttID(className, objectClassMap, rdnAttIds, new HashSet<>());
             if (rdn == null || rdn.isBlank()) continue;
             List<String> naming = mergeNamingAttribute(info.getNamingAttributes(), rdn);
-            if (namingEquals(info.getNamingAttributes(), naming)) continue;
+            if (Objects.equals(info.getNamingAttributes(), naming)) continue;
             objectClassMap.put(className, new LDAPObjectClassInfo(
                     info.getName(),
                     info.getMustAttributes(),
@@ -485,12 +485,6 @@ public class SchemaService {
             }
         }
         return new ArrayList<>(merged.values());
-    }
-
-    private static boolean namingEquals(List<String> a, List<String> b) {
-        if (a == b) return true;
-        if (a == null || b == null) return false;
-        return a.equals(b);
     }
 
     /** True for values like {@code 2.5.4.3} (digits and dots only, with at least one of each). */
