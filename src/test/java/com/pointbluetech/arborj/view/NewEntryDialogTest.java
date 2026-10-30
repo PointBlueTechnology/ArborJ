@@ -72,23 +72,6 @@ class NewEntryDialogTest {
     }
 
     @Test
-    @DisplayName("rdnFieldConflict is null when MUST matches RDN or RDN is not MUST")
-    void rdnFieldConflictNone() {
-        assertNull(NewEntryDialog.rdnFieldConflict(Map.of("cn", "Alice"), "cn", "Alice"));
-        assertNull(NewEntryDialog.rdnFieldConflict(Map.of("groupType", "2"), "cn", "gr2"));
-        assertNull(NewEntryDialog.rdnFieldConflict(null, "cn", "gr2"));
-    }
-
-    @Test
-    @DisplayName("rdnFieldConflict returns the MUST field name when it disagrees with the RDN")
-    void rdnFieldConflictWhenDifferent() {
-        assertEquals("cn", NewEntryDialog.rdnFieldConflict(
-                Map.of("cn", "from-field"), "cn", "from-rdn"));
-        assertEquals("CN", NewEntryDialog.rdnFieldConflict(
-                Map.of("CN", "x"), "cn", "y"));
-    }
-
-    @Test
     @DisplayName("create payload with no MUST fields still sends the RDN attribute")
     void createPayloadRdnOnly() {
         Map<String, List<String>> attrs =
@@ -192,15 +175,11 @@ class NewEntryDialogTest {
     }
 
     @Test
-    @DisplayName("leading space is escaped in the DN and preserved in the Add")
-    void rdnEscapesLeadingSpace() {
-        assertEscapedRdn(" Alice", "cn=\\ Alice");
-    }
-
-    @Test
-    @DisplayName("trailing space is escaped in the DN and preserved in the Add")
-    void rdnEscapesTrailingSpace() {
-        assertEscapedRdn("Alice ", "cn=Alice\\ ");
+    @DisplayName("padded RDN value is trimmed: \" Bob \" becomes DN cn=Bob and Add Bob")
+    void rdnValueIsTrimmed() {
+        assertEquals("cn=Bob", NewEntryDialog.formatRDN("cn", " Bob "));
+        assertEquals(List.of("Bob"),
+                NewEntryDialog.buildCreateAttributes(Map.of(), "cn", " Bob ").get("cn"));
     }
 
     @Test
@@ -219,6 +198,30 @@ class NewEntryDialogTest {
     @DisplayName("plain RDN value is not escaped")
     void rdnPlainValueUnchanged() {
         assertEscapedRdn("gr2", "cn=gr2");
+    }
+
+    @Test
+    @DisplayName("attribute type accepts LDAP descr and numeric OID")
+    void validAttributeTypes() {
+        assertTrue(NewEntryDialog.isValidAttributeType("cn"));
+        assertTrue(NewEntryDialog.isValidAttributeType("telephoneNumber"));
+        assertTrue(NewEntryDialog.isValidAttributeType("CN"));
+        assertTrue(NewEntryDialog.isValidAttributeType("  ou  "));
+        assertTrue(NewEntryDialog.isValidAttributeType("2.5.4.3"));
+        assertTrue(NewEntryDialog.isValidAttributeType("0.9.2342.19200300.100.1.1"));
+    }
+
+    @Test
+    @DisplayName("attribute type rejects empty, underscore, and junk")
+    void invalidAttributeTypes() {
+        assertFalse(NewEntryDialog.isValidAttributeType(null));
+        assertFalse(NewEntryDialog.isValidAttributeType(""));
+        assertFalse(NewEntryDialog.isValidAttributeType("  "));
+        assertFalse(NewEntryDialog.isValidAttributeType("cn=Bob"));
+        assertFalse(NewEntryDialog.isValidAttributeType("_cn"));
+        assertFalse(NewEntryDialog.isValidAttributeType("cn_name"));
+        assertFalse(NewEntryDialog.isValidAttributeType("1cn"));
+        assertFalse(NewEntryDialog.isValidAttributeType(".2.5.4.3"));
     }
 
     /** DN uses RFC 4514 escapes; Add attributes keep the unescaped field text. */

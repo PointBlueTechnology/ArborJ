@@ -13,6 +13,7 @@ import javafx.scene.layout.*;
 import javafx.scene.text.Font;
 
 import java.util.*;
+import java.util.regex.Pattern;
 
 /**
  * Two-step wizard dialog for creating a new LDAP entry.
@@ -51,6 +52,11 @@ public class NewEntryDialog extends Dialog<Void> {
     private final Button createButton = new Button("Create");
 
     private int currentStep = 1;
+
+    /** RFC 4512 descr: ALPHA *( ALPHA / DIGIT / HYPHEN ). */
+    private static final Pattern ATTR_DESCR = Pattern.compile("[A-Za-z][A-Za-z0-9-]*");
+    /** RFC 4512 numericoid: number *( DOT number ). */
+    private static final Pattern ATTR_OID = Pattern.compile("[0-9]+(?:\\.[0-9]+)*");
 
     public NewEntryDialog(MainController controller, String parentDN) {
         this(controller, parentDN, null);
@@ -244,9 +250,11 @@ public class NewEntryDialog extends Dialog<Void> {
             TextField field = new TextField();
             field.setFont(mono);
 
-            // Pre-populate the RDN attribute
+            // Prefill the RDN attribute from Step 1 and keep it read-only so
+            // the Add cannot disagree with the DN (Arbor does the same).
             if (attr.equalsIgnoreCase(rdnAttr)) {
                 field.setText(rdnValue != null ? rdnValue : "");
+                field.setEditable(false);
             }
 
             attributeGrid.add(label, 0, row);
@@ -324,12 +332,27 @@ public class NewEntryDialog extends Dialog<Void> {
     }
 
     private boolean validateStep1() {
-        String value = rdnField.getText();
-        if (value == null || value.isBlank()) {
+        String value = rdnField.getText() == null ? "" : rdnField.getText().trim();
+        if (value.isEmpty()) {
             showAlert(Alert.AlertType.WARNING, "Validation",
                     "Please enter an RDN value.");
             return false;
         }
+        rdnField.setText(value);
+
+        String attr = rdnAttrCombo.getValue();
+        if (attr == null || attr.isBlank()) {
+            rdnAttrCombo.setValue("cn");
+        } else {
+            attr = attr.trim();
+            if (!isValidAttributeType(attr)) {
+                showAlert(Alert.AlertType.WARNING, "Validation",
+                        "RDN attribute must be an LDAP name such as cn, or a numeric OID such as 2.5.4.3.");
+                return false;
+            }
+            rdnAttrCombo.setValue(attr);
+        }
+
         if (selectedClasses.isEmpty()) {
             showAlert(Alert.AlertType.WARNING, "Validation",
                     "Please select at least one objectClass.");
@@ -361,15 +384,6 @@ public class NewEntryDialog extends Dialog<Void> {
             fieldValues.put(entry.getKey(), entry.getValue().getText());
         }
 
-        String conflict = rdnFieldConflict(fieldValues, rdnAttr, rdnValue);
-        if (conflict != null) {
-            showAlert(Alert.AlertType.WARNING, "Validation",
-                    "Required attribute '" + conflict + "' must match the RDN value.");
-            TextField field = attributeFields.get(conflict);
-            if (field != null) field.requestFocus();
-            return;
-        }
-
         Map<String, List<String>> attributes = buildCreateAttributes(fieldValues, rdnAttr, rdnValue);
 
         List<String> objectClasses = new ArrayList<>(selectedClasses);
@@ -386,7 +400,7 @@ public class NewEntryDialog extends Dialog<Void> {
     static String formatRDN(String attr, String unescapedValue) {
         if (attr == null || attr.isBlank()) attr = "cn";
         else attr = attr.trim();
-        String value = unescapedValue == null ? "" : unescapedValue;
+        String value = unescapedValue == null ? "" : unescapedValue.trim();
         return new RDN(attr, value).toString();
     }
 
@@ -401,7 +415,7 @@ public class NewEntryDialog extends Dialog<Void> {
     static Map<String, List<String>> buildCreateAttributes(Map<String, String> fieldValues,
                                                            String rdnAttr, String rdnValue) {
         String attr = (rdnAttr == null || rdnAttr.isBlank()) ? "cn" : rdnAttr.trim();
-        String value = rdnValue == null ? "" : rdnValue;
+        String value = rdnValue == null ? "" : rdnValue.trim();
 
         Map<String, List<String>> attributes = new LinkedHashMap<>();
         if (fieldValues != null) {
@@ -422,19 +436,13 @@ public class NewEntryDialog extends Dialog<Void> {
     }
 
     /**
-     * Returns the MUST field name when it is the RDN attribute but holds a
-     * different value, or {@code null} when they agree or the RDN is not a MUST.
+     * True for an RFC 4512 attribute descr ({@code cn}, {@code telephoneNumber})
+     * or a numeric OID ({@code 2.5.4.3}).
      */
-    static String rdnFieldConflict(Map<String, String> fieldValues, String rdnAttr, String rdnValue) {
-        if (fieldValues == null) return null;
-        String attr = (rdnAttr == null || rdnAttr.isBlank()) ? "cn" : rdnAttr.trim();
-        String expected = rdnValue == null ? "" : rdnValue;
-        for (var entry : fieldValues.entrySet()) {
-            if (entry.getKey() == null || !entry.getKey().equalsIgnoreCase(attr)) continue;
-            String fieldValue = entry.getValue() == null ? "" : entry.getValue();
-            return fieldValue.equals(expected) ? null : entry.getKey();
-        }
-        return null;
+    static boolean isValidAttributeType(String attr) {
+        if (attr == null || attr.isBlank()) return false;
+        String trimmed = attr.trim();
+        return ATTR_DESCR.matcher(trimmed).matches() || ATTR_OID.matcher(trimmed).matches();
     }
 
     /**
