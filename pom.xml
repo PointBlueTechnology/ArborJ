@@ -6,7 +6,7 @@
 
     <groupId>com.pointbluetech</groupId>
     <artifactId>ArborJ</artifactId>
-    <version>2.0.9</version>
+    <version>2.0.10</version>
     <packaging>jar</packaging>
 
     <name>ArborJ</name>
@@ -21,7 +21,7 @@
         <jackson.version>2.18.2</jackson.version>
         <junit.version>5.11.4</junit.version>
         <app.name>ArborJ</app.name>
-        <app.version>2.0.9</app.version>
+        <app.version>2.0.10</app.version>
         <app.vendor>Pointblue Technology</app.vendor>
         <app.copyright>Copyright 2026 Pointblue Technology</app.copyright>
         <app.mainClass>com.pointbluetech.arborj.Launcher</app.mainClass>

@@ -71,6 +71,10 @@ public class WhatsNewDialog {
         features.setPadding(new Insets(8, 0, 8, 0));
 
         features.getChildren().addAll(
+                featureItem("Updated JavaFX",
+                        "ArborJ now uses JavaFX 25.0.5 with the latest security and "
+                        + "stability fixes, and bundles Java 25.0.5."),
+
                 featureItem("New Entry Names Work for Every Class",
                         "The naming-attribute list in New Entry now offers every valid "
                         + "choice for the classes you pick, including inherited ones such "
