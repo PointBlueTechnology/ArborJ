@@ -2,10 +2,10 @@ package com.pointbluetech.arborj.view;
 
 import com.pointbluetech.arborj.controller.MainController;
 import com.pointbluetech.arborj.service.AttributeSuggestSettings;
+import com.pointbluetech.arborj.service.SchemaService;
 import com.pointbluetech.arborj.model.DirectoryType;
 import com.pointbluetech.arborj.model.LDAPAttributeInfo;
 import com.pointbluetech.arborj.model.LDAPAttributeSyntax;
-import com.pointbluetech.arborj.model.LDAPObjectClassInfo;
 import javafx.animation.PauseTransition;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
@@ -29,7 +29,6 @@ import javafx.util.Duration;
 
 import java.io.File;
 import java.nio.file.Files;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -297,17 +296,8 @@ public final class EntryContextMenu {
      */
     private static Set<String> computeAllowedAttributes(MainController controller,
                                                          List<String> objectClasses) {
-        if (objectClasses == null || objectClasses.isEmpty()) return null;
-        Map<String, LDAPObjectClassInfo> ocMap = controller.getSchemaService().getObjectClassMap();
-        if (ocMap.isEmpty()) return null;
-        Set<String> allowed = new HashSet<>();
-        for (String oc : objectClasses) {
-            LDAPObjectClassInfo info = ocMap.get(oc.toLowerCase());
-            if (info == null) continue;
-            for (String a : info.getMustAttributes()) allowed.add(a.toLowerCase());
-            for (String a : info.getMayAttributes())  allowed.add(a.toLowerCase());
-        }
-        return allowed.isEmpty() ? null : allowed;
+        return SchemaService.allowedAttributeNames(
+                controller.getSchemaService().getObjectClassMap(), objectClasses);
     }
 
     /**
@@ -348,12 +338,7 @@ public final class EntryContextMenu {
             String text = field.getText();
             String lower = text == null ? "" : text.toLowerCase().trim();
             if (lower.length() < 1) { hide.run(); return; }
-            List<String> matches = attrMap.keySet().stream()
-                    .filter(n -> n.startsWith(lower))
-                    .filter(n -> allowedLower == null || allowedLower.contains(n))
-                    .sorted()
-                    .limit(12)
-                    .toList();
+            List<String> matches = SchemaService.suggestAttributeNames(attrMap, allowedLower, text);
             // Don't show the popup when the only match equals what the user typed.
             if (matches.isEmpty() || (matches.size() == 1 && matches.getFirst().equalsIgnoreCase(lower))) {
                 hide.run();
