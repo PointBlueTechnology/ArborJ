@@ -651,123 +651,38 @@ public class LDAPService {
     }
 
     /**
-     * Read-only: which Universal Password policy applies to {@code userDN}.
-     * Reads {@code nspmPasswordPolicyDN} on the user, the parent container,
-     * the partition root, and the Login Policy object. The partition root is
-     * the nearest ancestor that is a naming context or carries a
-     * {@code replica} attribute. When that root is not visible on this
-     * server, the lookup is not a conclusive "no policy". Does not modify
-     * the directory and does not require a writable connection.
+     * Read-only: which Universal Password policy NMAS applies to
+     * {@code userDN}, from the NMAS Get password policy information extended
+     * operation. NMAS does the inheritance (user, container, partition root,
+     * Login Policy). A failed or unsupported operation is
+     * {@link EdirPasswordPolicy.Status#UNKNOWN}, never "no policy".
      */
     public EdirPasswordPolicy.PolicyLookup findUniversalPasswordPolicy(String userDN)
             throws LDAPException {
         ensureConnected();
-        List<String> contexts = fetchNamingContexts();
-
-        Map<String, String> policies = new LinkedHashMap<>();
-        SearchResultEntry user = readEntryRequired(userDN, EdirPasswordPolicy.POLICY_ATTRIBUTE);
-        policies.put(userDN, attributeOrNull(user, EdirPasswordPolicy.POLICY_ATTRIBUTE));
-        // The user's own assignment wins. Don't walk containers we may not
-        // be allowed to read before reporting it.
-        if (policies.get(userDN) != null) {
-            return EdirPasswordPolicy.lookup(userDN, policies, null, false, null);
-        }
-
-        String parent = EdirPasswordPolicy.parentDn(userDN);
-        if (parent != null) {
-            SearchResultEntry parentEntry = readEntryIfPresent(parent, EdirPasswordPolicy.POLICY_ATTRIBUTE);
-            policies.put(parent, parentEntry == null
-                    ? null
-                    : attributeOrNull(parentEntry, EdirPasswordPolicy.POLICY_ATTRIBUTE));
-            if (policies.get(parent) != null) {
-                return EdirPasswordPolicy.lookup(userDN, policies, null, false, null);
-            }
-        }
-
-        EdirPasswordPolicy.PartitionAssessment partition =
-                EdirPasswordPolicy.assessPartition(probePartitionAncestors(userDN, contexts));
-        if (!partition.known()) {
-            return new EdirPasswordPolicy.PolicyLookup(null, false);
-        }
-
-        String root = partition.partitionRootDn();
-        if (root != null && (parent == null || !EdirPasswordPolicy.sameDn(root, parent))) {
-            try {
-                SearchResultEntry rootEntry = readEntryIfPresent(root, EdirPasswordPolicy.POLICY_ATTRIBUTE);
-                policies.put(root, rootEntry == null
-                        ? null
-                        : attributeOrNull(rootEntry, EdirPasswordPolicy.POLICY_ATTRIBUTE));
-            } catch (LDAPException e) {
-                if (e.getResultCode() == ResultCode.INSUFFICIENT_ACCESS_RIGHTS) {
-                    return new EdirPasswordPolicy.PolicyLookup(null, false);
-                }
-                throw e;
-            }
-        }
-
-        String loginDN = null;
+        LDAPConnection conn = connection;
+        if (conn == null) throw new LDAPException(ResultCode.SERVER_DOWN, "Not connected");
+        ExtendedResult result;
         try {
-            SearchResultEntry login = findLoginPolicyEntry(contexts);
-            loginDN = login == null ? null : login.getDN();
-            if (login != null) {
-                policies.put(loginDN, attributeOrNull(login, EdirPasswordPolicy.POLICY_ATTRIBUTE));
-            }
+            result = conn.processExtendedOperation(
+                    EdirPasswordPolicy.GET_POLICY_INFO_REQUEST_OID,
+                    EdirPasswordPolicy.encodeRequest(userDN));
         } catch (LDAPException e) {
-            if (e.getResultCode() == ResultCode.INSUFFICIENT_ACCESS_RIGHTS) {
-                // A policy already read on the partition root still applies.
-                // Not being able to read the Login Policy only matters when
-                // nothing closer was assigned.
-                EdirPasswordPolicy.PolicyLookup soFar =
-                        EdirPasswordPolicy.lookup(userDN, policies, root, true, null);
-                if (soFar.assignment() != null) return soFar;
-                return new EdirPasswordPolicy.PolicyLookup(null, false);
-            }
-            throw e;
+            return EdirPasswordPolicy.PolicyLookup.unknown(describeResult(
+                    e.getResultCode(), e.getDiagnosticMessage()));
         }
-        return EdirPasswordPolicy.lookup(userDN, policies, root, true, loginDN);
+        if (result.getResultCode() != ResultCode.SUCCESS) {
+            return EdirPasswordPolicy.PolicyLookup.unknown(describeResult(
+                    result.getResultCode(), result.getDiagnosticMessage()));
+        }
+        return EdirPasswordPolicy.decodeResponse(
+                result.getValue() == null ? null : result.getValue().getValue());
     }
 
-    /**
-     * Ancestors from the parent upward. A naming context is a partition root
-     * this server holds. Any closer container is checked for the operational
-     * {@code replica} attribute, which marks a partition root even when
-     * namingContexts omitted it. An unreadable ancestor ends the walk.
-     */
-    private List<EdirPasswordPolicy.AncestorProbe> probePartitionAncestors(
-            String userDN, List<String> namingContexts) throws LDAPException {
-        List<EdirPasswordPolicy.AncestorProbe> probes = new ArrayList<>();
-        String current = EdirPasswordPolicy.parentDn(userDN);
-        while (current != null) {
-            if (EdirPasswordPolicy.isNamingContext(current, namingContexts)) {
-                probes.add(new EdirPasswordPolicy.AncestorProbe(current, true, true));
-                break;
-            }
-            try {
-                SearchResultEntry entry = connection.getEntry(current, "replica");
-                if (entry == null) {
-                    probes.add(new EdirPasswordPolicy.AncestorProbe(current, false, false));
-                    break;
-                }
-                boolean replica = entry.hasAttribute("replica");
-                probes.add(new EdirPasswordPolicy.AncestorProbe(current, replica, true));
-                if (replica) break;
-            } catch (LDAPException e) {
-                ResultCode rc = e.getResultCode();
-                if (rc == ResultCode.NO_SUCH_ATTRIBUTE) {
-                    probes.add(new EdirPasswordPolicy.AncestorProbe(current, false, true));
-                } else if (rc == ResultCode.NO_SUCH_OBJECT
-                        || rc == ResultCode.REFERRAL
-                        || rc == ResultCode.INSUFFICIENT_ACCESS_RIGHTS
-                        || rc == ResultCode.INVALID_DN_SYNTAX) {
-                    probes.add(new EdirPasswordPolicy.AncestorProbe(current, false, false));
-                    break;
-                } else {
-                    throw e;
-                }
-            }
-            current = EdirPasswordPolicy.parentDn(current);
-        }
-        return probes;
+    private static String describeResult(ResultCode rc, String diagnostic) {
+        String text = rc == null ? "error" : rc.getName() + " (" + rc.intValue() + ")";
+        if (diagnostic != null && !diagnostic.isBlank()) text += ": " + diagnostic.trim();
+        return text;
     }
 
     /**
@@ -787,116 +702,6 @@ public class LDAPService {
         boolean useTls = currentConfig != null && currentConfig.isUseTLS();
         int port = currentConfig != null ? currentConfig.getPort() : 0;
         return EdirPasswordPolicy.connectionIsSecure(connected, ssl, useTls, port);
-    }
-
-    private SearchResultEntry readEntryRequired(String dn, String attribute) throws LDAPException {
-        try {
-            SearchResultEntry entry = connection.getEntry(dn, attribute);
-            if (entry == null) {
-                throw new LDAPException(ResultCode.NO_SUCH_OBJECT, "Entry not found: " + dn);
-            }
-            return entry;
-        } catch (LDAPException e) {
-            if (e.getResultCode() == ResultCode.NO_SUCH_OBJECT) {
-                throw new LDAPException(ResultCode.NO_SUCH_OBJECT, "Entry not found: " + dn, e);
-            }
-            throw e;
-        }
-    }
-
-    /**
-     * Base-level read. Missing entries, referrals, and unparsable DNs are
-     * "not present". Any other failure (including insufficient rights) is
-     * raised so a policy we could not see is not reported as absent.
-     */
-    private SearchResultEntry readEntryIfPresent(String dn, String attribute) throws LDAPException {
-        try {
-            return connection.getEntry(dn, attribute);
-        } catch (LDAPException e) {
-            ResultCode rc = e.getResultCode();
-            if (rc == ResultCode.NO_SUCH_OBJECT
-                    || rc == ResultCode.INVALID_DN_SYNTAX
-                    || rc == ResultCode.REFERRAL) {
-                return null;
-            }
-            throw e;
-        }
-    }
-
-    private static String attributeOrNull(SearchResultEntry entry, String attribute) {
-        if (entry == null) return null;
-        String value = entry.getAttributeValue(attribute);
-        if (value == null || value.isBlank()) return null;
-        return value;
-    }
-
-    /**
-     * Locate {@code cn=Login Policy} under the Security container. Tries the
-     * well-known DNs first, then a one-level search. An access failure is
-     * remembered and rethrown only when no Login Policy entry was found, so
-     * a missing {@code cn=Security} at the root does not hide the real one
-     * under a naming context — and a Security container we cannot read is
-     * not treated as "no policy".
-     */
-    private SearchResultEntry findLoginPolicyEntry(List<String> namingContexts) throws LDAPException {
-        LDAPException accessDenied = null;
-        for (String dn : EdirPasswordPolicy.loginPolicyCandidates(namingContexts)) {
-            try {
-                SearchResultEntry entry = connection.getEntry(dn, EdirPasswordPolicy.POLICY_ATTRIBUTE);
-                if (entry != null) return entry;
-            } catch (LDAPException e) {
-                if (e.getResultCode() == ResultCode.INSUFFICIENT_ACCESS_RIGHTS) {
-                    accessDenied = e;
-                    continue;
-                }
-                if (e.getResultCode() == ResultCode.NO_SUCH_OBJECT
-                        || e.getResultCode() == ResultCode.INVALID_DN_SYNTAX
-                        || e.getResultCode() == ResultCode.REFERRAL) {
-                    continue;
-                }
-                throw e;
-            }
-        }
-        for (String base : EdirPasswordPolicy.securityContainerCandidates(namingContexts)) {
-            try {
-                SearchResultEntry entry = searchLoginPolicy(base);
-                if (entry != null) return entry;
-            } catch (LDAPException e) {
-                if (e.getResultCode() == ResultCode.INSUFFICIENT_ACCESS_RIGHTS) {
-                    accessDenied = e;
-                    continue;
-                }
-                throw e;
-            }
-        }
-        if (accessDenied != null) throw accessDenied;
-        return null;
-    }
-
-    private SearchResultEntry searchLoginPolicy(String base) throws LDAPException {
-        SearchRequest request = new SearchRequest(base,
-                com.unboundid.ldap.sdk.SearchScope.ONE,
-                "(cn=Login Policy)",
-                EdirPasswordPolicy.POLICY_ATTRIBUTE);
-        request.setSizeLimit(1);
-        request.setTimeLimitSeconds(15);
-        try {
-            SearchResult result = connection.search(request);
-            if (result.getSearchEntries().isEmpty()) return null;
-            return result.getSearchEntries().getFirst();
-        } catch (LDAPSearchException e) {
-            if (e.getResultCode() == ResultCode.SIZE_LIMIT_EXCEEDED
-                    && e.getSearchResult() != null
-                    && !e.getSearchResult().getSearchEntries().isEmpty()) {
-                return e.getSearchResult().getSearchEntries().getFirst();
-            }
-            if (e.getResultCode() == ResultCode.NO_SUCH_OBJECT
-                    || e.getResultCode() == ResultCode.REFERRAL
-                    || e.getResultCode() == ResultCode.INVALID_DN_SYNTAX) {
-                return null;
-            }
-            throw e;
-        }
     }
 
     // --- Active Directory Helpers ---

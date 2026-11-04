@@ -29,13 +29,12 @@ class LDAPServicePasswordErrorTest {
                 Password change failed: Password too short
 
                 [result: other (80)]""", msg);
-        // The dialog sees the formatted text (no longer says "NMAS") wrapped
-        // around the server exception, which still carries the matched DN.
+        // The dialog sees the formatted text wrapped around the server
+        // exception, which still carries the matched DN.
         LDAPException cause = new LDAPException(ResultCode.OTHER,
                 "NMAS Change Password extension failed", "-216", null);
-        assertTrue(EdirPasswordPolicy.passwordModifySuggestsLegacy(
+        assertEquals(-216, EdirPasswordPolicy.nmasCode(
                 new LDAPException(ResultCode.OTHER, msg, cause)));
-        assertTrue(EdirPasswordPolicy.passwordModifySuggestsLegacy(cause));
     }
 
     @Test

@@ -4,7 +4,6 @@ import com.pointbluetech.arborj.controller.MainController;
 import com.pointbluetech.arborj.model.DirectoryType;
 import com.pointbluetech.arborj.util.EdirPasswordPolicy;
 import javafx.application.Platform;
-import javafx.beans.binding.Bindings;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
 import javafx.scene.control.*;
@@ -12,20 +11,20 @@ import javafx.scene.layout.*;
 import javafx.scene.text.Font;
 
 /**
- * Password change dialog that adapts its UI and behavior
- * based on the connected directory type.
+ * Administrative password reset. The new password is set with the bound
+ * account's rights; the user's current password is never asked for.
  *
- * - Active Directory: new password only, plus UAC flag checkboxes.
- * - eDirectory: shows the Universal Password policy that applies (read from
- *   {@code nspmPasswordPolicyDN} on the user, the parent container, the
- *   partition root, or the Login Policy). When none applies, the user
- *   chooses Universal Password (RFC 3062) or Legacy NDS (replace
- *   {@code userPassword} over LDAPS). A Password Modify failure offers
- *   that legacy replace only when the policy lookup succeeded and found
- *   no policy. The writes run off the JavaFX thread.
- * - Generic / OpenLDAP: RFC 3062 Password Modify. Supports self-service
- *   (current + new password) and administrative reset (new password only —
- *   uses the connected admin's rights).
+ * - Active Directory: replace unicodePwd, plus UAC flag checkboxes.
+ * - eDirectory: asks NMAS which Universal Password policy applies (Get
+ *   password policy information extended operation). When NMAS says none
+ *   applies, the user chooses Universal Password (RFC 3062) or Legacy NDS
+ *   (replace {@code userPassword} over LDAPS), with Legacy preselected. A
+ *   Password Modify failure offers that legacy replace only when NMAS said
+ *   no policy applies and the failure is not a rights error.
+ * - Generic / OpenLDAP: RFC 3062 Password Modify without the old password.
+ *
+ * The writes run off the JavaFX thread. OK and Cancel are disabled while
+ * one is in flight.
  */
 public class ChangePasswordDialog extends Dialog<Void> {
 
@@ -34,14 +33,8 @@ public class ChangePasswordDialog extends Dialog<Void> {
     private final MainController controller;
     private final String targetDN;
 
-    private final PasswordField currentPasswordField = new PasswordField();
     private final PasswordField newPasswordField = new PasswordField();
     private final PasswordField confirmPasswordField = new PasswordField();
-
-    // Non-AD: admin-reset toggle (RFC 3062 allows omitting the old password
-    // when the bound user has reset rights on the target).
-    private final CheckBox adminResetCheckbox =
-            new CheckBox("Administrative reset (don't require current password)");
 
     // eDirectory: policy status and, when no Universal Password policy
     // applies, which write to send.
@@ -57,11 +50,13 @@ public class ChangePasswordDialog extends Dialog<Void> {
     private final Label legacySecureHint = new Label(
             "Legacy NDS replaces userPassword and needs an LDAPS connection.");
     private final Label legacyNoVerifyHint = new Label(
-            "Legacy NDS does not verify the current password. It replaces userPassword using the bound account's rights.");
+            "Legacy NDS replaces userPassword using the bound account's rights. It does not go through Universal Password.");
 
     /** Set on the JavaFX thread when the policy read finishes. Null if it failed. */
     private EdirPasswordPolicy.PolicyLookup policyLookup;
     private Button okButton;
+    private Button cancelButton;
+    private boolean busy;
 
     // AD-specific controls
     private final CheckBox mustChangeCheckbox = new CheckBox("User must change password at next logon");
@@ -89,7 +84,6 @@ public class ChangePasswordDialog extends Dialog<Void> {
         DirectoryType dirType = controller.directoryTypeProperty().get();
 
         Font mono = Font.font("monospaced", 12);
-        currentPasswordField.setFont(mono);
         newPasswordField.setFont(mono);
         confirmPasswordField.setFont(mono);
 
@@ -105,6 +99,12 @@ public class ChangePasswordDialog extends Dialog<Void> {
         getDialogPane().getButtonTypes().addAll(okType, cancelType);
 
         okButton = (Button) getDialogPane().lookupButton(okType);
+        cancelButton = (Button) getDialogPane().lookupButton(cancelType);
+        // The window's close box and Esc also close the dialog. Keep it open
+        // while a write is in flight.
+        setOnCloseRequest(e -> {
+            if (busy) e.consume();
+        });
         Button okBtn = okButton;
         // addEventFilter (not setOnAction): JavaFX runs filters before the
         // Dialog's internal action that closes the pane, so consuming here
@@ -180,34 +180,6 @@ public class ChangePasswordDialog extends Dialog<Void> {
             methodBox.setVisible(false);
             methodBox.setManaged(false);
             form.add(methodBox, 0, row++, 2, 1);
-        }
-
-        // Current password -- shown for non-AD directories, and only when
-        // an administrative reset is NOT being performed. Legacy NDS is a
-        // userPassword replace and does not send the current password.
-        boolean showOldPassword = dirType != DirectoryType.ACTIVE_DIRECTORY;
-        Label currentLabel = new Label("Current Password:");
-        if (showOldPassword) {
-            form.add(currentLabel, 0, row);
-            form.add(currentPasswordField, 1, row++);
-
-            // Empty placeholder cell + checkbox in the value column
-            form.add(adminResetCheckbox, 1, row++);
-
-            var showCurrent = Bindings.and(
-                    adminResetCheckbox.selectedProperty().not(),
-                    legacyRadio.selectedProperty().not());
-            currentLabel.visibleProperty().bind(showCurrent);
-            currentLabel.managedProperty().bind(currentLabel.visibleProperty());
-            currentPasswordField.visibleProperty().bind(showCurrent);
-            currentPasswordField.managedProperty().bind(currentPasswordField.visibleProperty());
-            adminResetCheckbox.visibleProperty().bind(legacyRadio.selectedProperty().not());
-            adminResetCheckbox.managedProperty().bind(adminResetCheckbox.visibleProperty());
-            // Clear the field when switching to admin-reset so a stale value
-            // can't accidentally be sent.
-            adminResetCheckbox.selectedProperty().addListener((obs, was, now) -> {
-                if (now) currentPasswordField.clear();
-            });
         }
 
         // New password
@@ -289,37 +261,23 @@ public class ChangePasswordDialog extends Dialog<Void> {
             confirmPasswordField.requestFocus();
             return;
         }
-        // Self-service (non-admin) Password Modify requires the current
-        // password. A legacy NDS replace does not send one.
-        if (dirType != DirectoryType.ACTIVE_DIRECTORY
-                && !legacyRadio.isSelected()
-                && !adminResetCheckbox.isSelected()
-                && currentPasswordField.getText().isEmpty()) {
-            showError("Current password is required.\n\n"
-                    + "Check “Administrative reset” if you are doing an "
-                    + "admin password reset using your bound credentials.");
-            currentPasswordField.requestFocus();
-            return;
-        }
-
         // Read every control here. The write itself runs off the JavaFX thread.
         boolean legacy = legacyRadio.isSelected();
-        String oldPassword = effectiveOldPassword();
         boolean mustChange = mustChangeCheckbox.isSelected();
         boolean neverExpires = neverExpiresCheckbox.isSelected();
         boolean applyUac = uacFetched;
         int uac = currentUAC;
         EdirPasswordPolicy.PolicyLookup lookup = policyLookup;
 
-        okButton.setDisable(true);
+        setBusy(true);
         Thread.ofVirtual().start(() -> {
             try {
-                writePassword(dirType, newPassword, oldPassword, legacy,
+                writePassword(dirType, newPassword, legacy,
                         mustChange, neverExpires, applyUac, uac);
                 Platform.runLater(this::close);
             } catch (Exception ex) {
                 Platform.runLater(() -> {
-                    okButton.setDisable(false);
+                    setBusy(false);
                     // formatPasswordError's text is the exception message.
                     // A legacy retry is only for a conclusive "no policy".
                     String msg = messageOf(ex);
@@ -335,8 +293,7 @@ public class ChangePasswordDialog extends Dialog<Void> {
         });
     }
 
-    private void writePassword(DirectoryType dirType, String newPassword, String oldPassword,
-                               boolean legacy, boolean mustChange, boolean neverExpires,
+    private void writePassword(DirectoryType dirType, String newPassword, boolean legacy, boolean mustChange, boolean neverExpires,
                                boolean applyUac, int uac) throws Exception {
         switch (dirType) {
             case ACTIVE_DIRECTORY -> {
@@ -353,17 +310,17 @@ public class ChangePasswordDialog extends Dialog<Void> {
                 if (legacy) {
                     controller.getLdapService().changePasswordLegacyNDS(targetDN, newPassword);
                 } else {
-                    controller.getLdapService().changePasswordEDir(targetDN, oldPassword, newPassword);
+                    controller.getLdapService().changePasswordEDir(targetDN, null, newPassword);
                 }
             }
             default -> controller.getLdapService().changePasswordRFC3062(
-                    targetDN, oldPassword, newPassword);
+                    targetDN, null, newPassword);
         }
     }
 
     /**
-     * Password Modify failed and the lookup had already found no Universal
-     * Password policy. Ask before replacing {@code userPassword}. The
+     * Password Modify failed and NMAS had already said no Universal
+     * Password policy applies. Ask before replacing {@code userPassword}. The
      * replace runs off the JavaFX thread. A cleartext connection cannot do
      * it, so the Password Modify error stands.
      */
@@ -380,22 +337,21 @@ public class ChangePasswordDialog extends Dialog<Void> {
         alert.setContentText(message
                 + "\n\nNo Universal Password policy applies. Retry with Legacy NDS "
                 + "(replace userPassword over this LDAPS connection)? "
-                + "That does not verify the current password and does not go "
-                + "through Universal Password.");
+                + "That does not go through Universal Password.");
         alert.getButtonTypes().setAll(ButtonType.YES, ButtonType.NO);
         var window = ownerWindow();
         if (window != null) alert.initOwner(window);
         var choice = alert.showAndWait();
         if (choice.isEmpty() || choice.get() != ButtonType.YES) return;
 
-        okButton.setDisable(true);
+        setBusy(true);
         Thread.ofVirtual().start(() -> {
             try {
                 controller.getLdapService().changePasswordLegacyNDS(targetDN, newPassword);
                 Platform.runLater(this::close);
             } catch (Exception retryEx) {
                 Platform.runLater(() -> {
-                    okButton.setDisable(false);
+                    setBusy(false);
                     showError(messageOf(retryEx));
                 });
             }
@@ -427,8 +383,8 @@ public class ChangePasswordDialog extends Dialog<Void> {
                 policyLookup = error == null ? found : null;
                 EdirPasswordPolicy.PolicyLookup forUi = policyLookup;
                 policyStatusLabel.setText(EdirPasswordPolicy.describeStatus(forUi, error));
-                boolean hasPolicy = forUi != null && forUi.assignment() != null;
-                policyDnLabel.setText(hasPolicy ? forUi.assignment().policyDN() : "");
+                boolean hasPolicy = forUi != null && forUi.hasPolicy();
+                policyDnLabel.setText(hasPolicy ? forUi.policyDN() : "");
                 policyDnLabel.setVisible(hasPolicy);
                 policyDnLabel.setManaged(hasPolicy);
 
@@ -457,16 +413,11 @@ public class ChangePasswordDialog extends Dialog<Void> {
         return msg;
     }
 
-    /**
-     * Returns the old-password value to send with RFC 3062, or null when the
-     * user has selected an administrative reset. UnboundID's
-     * PasswordModifyExtendedRequest accepts null for the old password and the
-     * server uses the bound user's rights to authorize the change.
-     */
-    private String effectiveOldPassword() {
-        if (adminResetCheckbox.isSelected()) return null;
-        String typed = currentPasswordField.getText();
-        return typed.isEmpty() ? null : typed;
+    /** Disable OK and Cancel while a write is in flight, so the dialog can't close under it. */
+    private void setBusy(boolean busy) {
+        this.busy = busy;
+        okButton.setDisable(busy);
+        cancelButton.setDisable(busy);
     }
 
     private void showError(String message) {

@@ -1,12 +1,12 @@
 package com.pointbluetech.arborj.util;
 
-import com.pointbluetech.arborj.util.EdirPasswordPolicy.AncestorProbe;
-import com.pointbluetech.arborj.util.EdirPasswordPolicy.Assignment;
 import com.pointbluetech.arborj.util.EdirPasswordPolicy.Method;
-import com.pointbluetech.arborj.util.EdirPasswordPolicy.PartitionAssessment;
 import com.pointbluetech.arborj.util.EdirPasswordPolicy.PolicyLookup;
-import com.pointbluetech.arborj.util.EdirPasswordPolicy.Source;
+import com.pointbluetech.arborj.util.EdirPasswordPolicy.Status;
+import com.unboundid.asn1.ASN1Element;
+import com.unboundid.asn1.ASN1Integer;
 import com.unboundid.asn1.ASN1OctetString;
+import com.unboundid.asn1.ASN1Sequence;
 import com.unboundid.ldap.sdk.Control;
 import com.unboundid.ldap.sdk.LDAPException;
 import com.unboundid.ldap.sdk.ResultCode;
@@ -14,9 +14,8 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
+import java.io.ByteArrayOutputStream;
+import java.util.HexFormat;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -25,454 +24,214 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class EdirPasswordPolicyTest {
 
-    private static final String USER = "cn=alice,ou=eng,ou=users,o=acme";
-    private static final String PARENT = "ou=eng,ou=users,o=acme";
-    private static final String MIDDLE = "ou=users,o=acme";
-    private static final String PARTITION = "o=acme";
+    private static final String USER = "cn=alice,ou=eng,o=acme";
     private static final String POLICY = "cn=Sample Password Policy,cn=Password Policies,cn=Security";
-    private static final String OTHER = "cn=Other Policy,cn=Password Policies,cn=Security";
-    private static final String LOGIN = "cn=Login Policy,cn=Security";
 
-    private static Map<String, String> policies(String... kv) {
-        Map<String, String> map = new LinkedHashMap<>();
-        for (int i = 0; i < kv.length; i += 2) {
-            map.put(kv[i], kv[i + 1]);
-        }
-        return map;
+    private static byte[] seq(ASN1Element... elements) {
+        return new ASN1Sequence(elements).encode();
+    }
+
+    private static byte[] concat(ASN1Element... elements) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        for (ASN1Element e : elements) out.writeBytes(e.encode());
+        return out.toByteArray();
     }
 
     @Nested
-    @DisplayName("resolve")
-    class Resolve {
+    @DisplayName("request encoding")
+    class Request {
 
         @Test
-        @DisplayName("a policy on the user wins over the container, partition, and Login Policy")
-        void userAssignmentWins() {
-            Map<String, String> map = policies(
-                    USER, POLICY,
-                    PARENT, OTHER,
-                    PARTITION, OTHER,
-                    LOGIN, OTHER);
+        @DisplayName("SEQUENCE { INTEGER 1, OCTET STRING userDN }")
+        void layout() throws Exception {
+            byte[] value = EdirPasswordPolicy.encodeRequest("cn=a").getValue();
+            assertEquals("3009020101040463 6e3d61".replace(" ", ""),
+                    HexFormat.of().formatHex(value));
 
-            Assignment found = EdirPasswordPolicy.resolve(USER, map, List.of(PARTITION), LOGIN);
-
-            assertEquals(POLICY, found.policyDN());
-            assertEquals(Source.USER, found.source());
-            assertEquals(USER, found.assignedOnDN());
+            ASN1Element[] elements = ASN1Sequence.decodeAsSequence(value).elements();
+            assertEquals(2, elements.length);
+            assertEquals(1, ASN1Integer.decodeAsInteger(elements[0]).intValue());
+            assertEquals(USER, ASN1OctetString.decodeAsOctetString(
+                    ASN1Sequence.decodeAsSequence(EdirPasswordPolicy.encodeRequest(USER).getValue())
+                            .elements()[1]).stringValue());
         }
 
         @Test
-        @DisplayName("the parent container wins over the partition root and the Login Policy")
-        void containerBeatsPartitionAndLoginPolicy() {
-            Map<String, String> map = policies(
-                    USER, null,
-                    PARENT, POLICY,
-                    PARTITION, OTHER,
-                    LOGIN, OTHER);
-
-            Assignment found = EdirPasswordPolicy.resolve(USER, map, List.of(PARTITION), LOGIN);
-
-            assertEquals(Source.CONTAINER, found.source());
-            assertEquals(POLICY, found.policyDN());
-            assertTrue(found.sourceText().contains(PARENT));
-        }
-
-        @Test
-        @DisplayName("a policy on a container that is neither the parent nor the partition root is ignored")
-        void intermediateContainerDoesNotApply() {
-            // ou=users is between the parent and the partition root, and it is
-            // not itself a partition. NMAS does not inherit that assignment.
-            Map<String, String> map = policies(
-                    USER, null,
-                    PARENT, null,
-                    MIDDLE, POLICY,
-                    PARTITION, null,
-                    LOGIN, null);
-
-            assertNull(EdirPasswordPolicy.resolve(USER, map, List.of(PARTITION), LOGIN));
-        }
-
-        @Test
-        @DisplayName("the partition root applies when the parent container has no policy")
-        void partitionRootWhenParentHasNone() {
-            Map<String, String> map = policies(
-                    USER, "",
-                    PARENT, "   ",
-                    PARTITION, POLICY,
-                    LOGIN, OTHER);
-
-            Assignment found = EdirPasswordPolicy.resolve(USER, map, List.of(PARTITION), LOGIN);
-
-            assertEquals(Source.PARTITION_ROOT, found.source());
-            assertEquals(POLICY, found.policyDN());
-            assertEquals(PARTITION, found.assignedOnDN());
-        }
-
-        @Test
-        @DisplayName("a child partition does not inherit the parent partition's policy")
-        void childPartitionDoesNotUseParentPartition() {
-            String user = "cn=alice,ou=secret,o=acme";
-            String childPartition = "ou=secret,o=acme";
-            Map<String, String> map = policies(
-                    user, null,
-                    "ou=secret,o=acme", null,
-                    PARTITION, POLICY,
-                    LOGIN, null);
-
-            assertNull(EdirPasswordPolicy.resolve(
-                    user, map, List.of(PARTITION, childPartition), LOGIN));
-        }
-
-        @Test
-        @DisplayName("the Login Policy is the default when nothing closer is assigned")
-        void loginPolicyIsTheDefault() {
-            Map<String, String> map = policies(
-                    USER, null,
-                    PARENT, null,
-                    PARTITION, null,
-                    LOGIN, POLICY);
-
-            Assignment found = EdirPasswordPolicy.resolve(USER, map, List.of(PARTITION), LOGIN);
-
-            assertEquals(Source.LOGIN_POLICY, found.source());
-            assertEquals(POLICY, found.policyDN());
-            assertEquals(LOGIN, found.assignedOnDN());
-        }
-
-        @Test
-        @DisplayName("no assignment anywhere means legacy NDS rules")
-        void nothingAssigned() {
-            Map<String, String> map = policies(USER, null, PARENT, null, PARTITION, null, LOGIN, null);
-            assertNull(EdirPasswordPolicy.resolve(USER, map, List.of(PARTITION), LOGIN));
-            assertNull(EdirPasswordPolicy.resolve(USER, map, List.of(PARTITION), null));
-        }
-
-        @Test
-        @DisplayName("DN spelling differences still match")
-        void dnMatchIsCaseInsensitive() {
-            Map<String, String> map = new LinkedHashMap<>();
-            map.put("CN=Alice,OU=Eng,OU=Users,O=ACME", POLICY);
-
-            Assignment found = EdirPasswordPolicy.resolve(USER, map, List.of("O=Acme"), null);
-
-            assertEquals(Source.USER, found.source());
-            assertEquals("CN=Alice,OU=Eng,OU=Users,O=ACME", found.assignedOnDN());
-        }
-
-        @Test
-        @DisplayName("a blank user DN does not resolve")
-        void blankUser() {
-            assertNull(EdirPasswordPolicy.resolve("  ", Map.of(USER, POLICY), List.of(PARTITION), LOGIN));
-            assertNull(EdirPasswordPolicy.resolve(null, Map.of(), List.of(), null));
+        @DisplayName("OIDs are the NMAS Get password policy information pair")
+        void oids() {
+            assertEquals("2.16.840.1.113719.1.39.42.100.19", EdirPasswordPolicy.GET_POLICY_INFO_REQUEST_OID);
+            assertEquals("2.16.840.1.113719.1.39.42.100.20", EdirPasswordPolicy.GET_POLICY_INFO_RESPONSE_OID);
         }
     }
 
     @Nested
-    @DisplayName("which entries are consulted")
-    class SearchList {
+    @DisplayName("response decoding")
+    class Response {
 
         @Test
-        @DisplayName("user directly in a partition is not read twice")
-        void parentThatIsThePartitionIsListedOnce() {
-            String user = "cn=alice,o=acme";
-            assertEquals(List.of(user, "o=acme"),
-                    EdirPasswordPolicy.policySearchDns(user, List.of("o=acme", "")));
+        @DisplayName("version, error 0, policy DN is a policy")
+        void policy() {
+            PolicyLookup lookup = EdirPasswordPolicy.decodeResponse(seq(
+                    new ASN1Integer(1), new ASN1Integer(0), new ASN1OctetString(POLICY)));
+            assertEquals(Status.POLICY, lookup.status());
+            assertEquals(POLICY, lookup.policyDN());
         }
 
         @Test
-        @DisplayName("parent and a different partition root are both listed; intermediate containers are not")
-        void parentAndPartitionOnly() {
-            List<String> dns = EdirPasswordPolicy.policySearchDns(USER, List.of(PARTITION, "cn=Security"));
-            assertEquals(List.of(USER, PARENT, PARTITION), dns);
-            assertFalse(dns.contains(MIDDLE));
+        @DisplayName("the elements without the outer SEQUENCE decode the same")
+        void unwrapped() {
+            PolicyLookup lookup = EdirPasswordPolicy.decodeResponse(concat(
+                    new ASN1Integer(1), new ASN1Integer(0), new ASN1OctetString(POLICY)));
+            assertEquals(Status.POLICY, lookup.status());
+            assertEquals(POLICY, lookup.policyDN());
         }
 
         @Test
-        @DisplayName("escaped comma in the RDN stays in the user DN")
-        void escapedCommaParent() {
-            String user = "cn=a\\,b,ou=c,o=d";
-            assertEquals("ou=c,o=d", EdirPasswordPolicy.parentDn(user));
-            assertNull(EdirPasswordPolicy.parentDn("cn=only"));
-            assertNull(EdirPasswordPolicy.parentDn(null));
+        @DisplayName("error 0 with no DN, or an empty DN, is no policy")
+        void none() {
+            assertEquals(Status.NONE, EdirPasswordPolicy.decodeResponse(seq(
+                    new ASN1Integer(1), new ASN1Integer(0))).status());
+            assertEquals(Status.NONE, EdirPasswordPolicy.decodeResponse(seq(
+                    new ASN1Integer(1), new ASN1Integer(0), new ASN1OctetString(""))).status());
         }
 
         @Test
-        @DisplayName("the nearest naming context is the partition, ignoring spacing")
-        void nearestNamingContext() {
-            assertEquals("ou=users, o=acme",
-                    EdirPasswordPolicy.nearestPartitionRoot(
-                            "cn=alice,ou=eng,ou=users,o=acme",
-                            List.of("", "o=acme", "ou=users, o=acme", "o=other")));
-            // The user entry is not its own partition root.
-            assertNull(EdirPasswordPolicy.nearestPartitionRoot("o=acme", List.of("o=acme")));
+        @DisplayName("a non-zero NMAS error is unknown, not no policy")
+        void nmasError() {
+            PolicyLookup lookup = EdirPasswordPolicy.decodeResponse(seq(
+                    new ASN1Integer(1), new ASN1Integer(-1697)));
+            assertEquals(Status.UNKNOWN, lookup.status());
+            assertEquals("NMAS error -1697", lookup.detail());
         }
-    }
-
-    @Nested
-    @DisplayName("Login Policy location")
-    class LoginPolicyDn {
 
         @Test
-        @DisplayName("candidates cover the root Security container and each naming context")
-        void candidates() {
-            List<String> contexts = List.of("", "o=acme", "cn=Security,o=acme");
-            assertEquals(List.of(
-                            "cn=Security",
-                            "cn=Security,o=acme"),
-                    EdirPasswordPolicy.securityContainerCandidates(contexts));
-            assertEquals(List.of(
-                            "cn=Login Policy,cn=Security",
-                            "cn=Login Policy,cn=Security,o=acme"),
-                    EdirPasswordPolicy.loginPolicyCandidates(contexts));
+        @DisplayName("missing, short or garbled values are unknown and show the bytes")
+        void garbage() {
+            assertEquals(Status.UNKNOWN, EdirPasswordPolicy.decodeResponse(null).status());
+            assertEquals(Status.UNKNOWN, EdirPasswordPolicy.decodeResponse(new byte[0]).status());
+
+            PolicyLookup oneInt = EdirPasswordPolicy.decodeResponse(seq(new ASN1Integer(0)));
+            assertEquals(Status.UNKNOWN, oneInt.status());
+            assertTrue(oneInt.detail().contains("3003020100"), oneInt.detail());
+
+            PolicyLookup junk = EdirPasswordPolicy.decodeResponse(new byte[] {0x30, 0x05, 0x02});
+            assertEquals(Status.UNKNOWN, junk.status());
+            assertTrue(junk.detail().startsWith("unreadable response"), junk.detail());
         }
     }
 
     @Nested
-    @DisplayName("dialog decisions")
-    class DialogDecisions {
-
-        private final Assignment policy = new Assignment(POLICY, Source.USER, USER);
-        private final PolicyLookup found = new PolicyLookup(policy, true);
-        private final PolicyLookup none = new PolicyLookup(null, true);
+    @DisplayName("method choice")
+    class Choice {
 
         @Test
-        @DisplayName("a found policy is shown and Password Modify stays selected")
-        void policyFound() {
-            String status = EdirPasswordPolicy.describeStatus(found, null);
-            assertTrue(status.startsWith("Universal Password policy applies. "));
-            assertTrue(status.contains("Assigned to this user."));
-            assertFalse(EdirPasswordPolicy.offerMethodChoice(found));
+        @DisplayName("Legacy is the default only for NMAS-confirmed no policy over LDAPS")
+        void defaults() {
+            assertEquals(Method.LEGACY_NDS, EdirPasswordPolicy.defaultMethod(PolicyLookup.none(), true));
+            assertEquals(Method.UNIVERSAL_PASSWORD, EdirPasswordPolicy.defaultMethod(PolicyLookup.none(), false));
             assertEquals(Method.UNIVERSAL_PASSWORD,
-                    EdirPasswordPolicy.defaultMethod(found, true));
-        }
-
-        @Test
-        @DisplayName("no policy offers the choice and defaults to legacy on LDAPS")
-        void noPolicyDefaultsToLegacyWhenSecure() {
-            String status = EdirPasswordPolicy.describeStatus(none, null);
-            assertTrue(status.contains("No Universal Password policy"));
-            assertTrue(status.contains("Login Policy"));
-            assertTrue(EdirPasswordPolicy.offerMethodChoice(none));
-            assertEquals(Method.LEGACY_NDS,
-                    EdirPasswordPolicy.defaultMethod(none, true));
-        }
-
-        @Test
-        @DisplayName("no policy on a cleartext connection keeps Password Modify")
-        void noPolicyOnCleartextStaysUniversal() {
+                    EdirPasswordPolicy.defaultMethod(PolicyLookup.unknown("x"), true));
             assertEquals(Method.UNIVERSAL_PASSWORD,
-                    EdirPasswordPolicy.defaultMethod(none, false));
+                    EdirPasswordPolicy.defaultMethod(PolicyLookup.policy(POLICY), true));
+            assertEquals(Method.UNIVERSAL_PASSWORD, EdirPasswordPolicy.defaultMethod(null, true));
         }
 
         @Test
-        @DisplayName("a failed lookup keeps Password Modify and still offers the choice")
-        void lookupFailed() {
-            String status = EdirPasswordPolicy.describeStatus(null, "insufficient access");
-            assertTrue(status.startsWith("Could not check whether a Universal Password policy applies: "));
-            assertTrue(status.contains("insufficient access"));
+        @DisplayName("the choice is hidden only when a policy applies")
+        void offer() {
+            assertFalse(EdirPasswordPolicy.offerMethodChoice(PolicyLookup.policy(POLICY)));
+            assertTrue(EdirPasswordPolicy.offerMethodChoice(PolicyLookup.none()));
+            assertTrue(EdirPasswordPolicy.offerMethodChoice(PolicyLookup.unknown("x")));
             assertTrue(EdirPasswordPolicy.offerMethodChoice(null));
-            assertEquals(Method.UNIVERSAL_PASSWORD,
-                    EdirPasswordPolicy.defaultMethod(null, true));
         }
 
         @Test
-        @DisplayName("partition and Login Policy source text names the entry")
-        void sourceText() {
-            assertEquals("Inherited from partition root " + PARTITION + ".",
-                    new Assignment(POLICY, Source.PARTITION_ROOT, PARTITION).sourceText());
-            assertEquals("Inherited from the Login Policy (" + LOGIN + ").",
-                    new Assignment(POLICY, Source.LOGIN_POLICY, LOGIN).sourceText());
+        @DisplayName("status text")
+        void status() {
+            assertEquals("Universal Password policy applies:",
+                    EdirPasswordPolicy.describeStatus(PolicyLookup.policy(POLICY), null));
+            assertEquals("No Universal Password policy applies to this user.",
+                    EdirPasswordPolicy.describeStatus(PolicyLookup.none(), null));
+            assertEquals("Could not check whether a Universal Password policy applies: "
+                            + "protocol error (2): Unrecognized extended operation. "
+                            + "Password Modify stays selected.",
+                    EdirPasswordPolicy.describeStatus(PolicyLookup.unknown(
+                            "protocol error (2): Unrecognized extended operation"), null));
+            assertTrue(EdirPasswordPolicy.describeStatus(null, "boom").contains("boom"));
         }
     }
 
     @Nested
-    @DisplayName("when to offer a legacy retry")
-    class LegacyRetry {
+    @DisplayName("legacy retry")
+    class Retry {
+
+        private final LDAPException generic = new LDAPException(ResultCode.OTHER,
+                "NMAS Change Password extension failed");
 
         @Test
-        @DisplayName("result 53 and 19 offer a retry")
-        void unwillingAndConstraint() {
-            assertTrue(EdirPasswordPolicy.passwordModifySuggestsLegacy(
-                    new LDAPException(ResultCode.UNWILLING_TO_PERFORM, "no")));
-            assertTrue(EdirPasswordPolicy.passwordModifySuggestsLegacy(
-                    new LDAPException(ResultCode.CONSTRAINT_VIOLATION, "too short")));
+        @DisplayName("offered after a Password Modify failure when NMAS said no policy")
+        void offered() {
+            assertTrue(EdirPasswordPolicy.offerLegacyRetry(PolicyLookup.none(), generic));
+            assertTrue(EdirPasswordPolicy.offerLegacyRetry(PolicyLookup.none(),
+                    new LDAPException(ResultCode.UNWILLING_TO_PERFORM, "x")));
+            assertTrue(EdirPasswordPolicy.offerLegacyRetry(PolicyLookup.none(),
+                    new RuntimeException("wrapped", generic)));
         }
 
         @Test
-        @DisplayName("an NMAS diagnostic or response control offers a retry")
-        void nmas() {
-            assertTrue(EdirPasswordPolicy.passwordModifySuggestsLegacy(
-                    new LDAPException(ResultCode.OTHER, "NMAS Change Password extension failed")));
-            Control control = new Control(EdirPasswordPolicy.NMAS_CONTROL_PREFIX + "7", false,
-                    new ASN1OctetString(new byte[] {(byte) 0xFF, (byte) 0xFF, (byte) 0xFF, 0x28}));
-            LDAPException withControl = new LDAPException(ResultCode.OTHER, "Password too short",
-                    null, null, new Control[] {control}, null);
-            assertTrue(EdirPasswordPolicy.passwordModifySuggestsLegacy(withControl));
+        @DisplayName("not offered when a policy applies or the lookup was inconclusive")
+        void lookupGates() {
+            assertFalse(EdirPasswordPolicy.offerLegacyRetry(PolicyLookup.policy(POLICY), generic));
+            assertFalse(EdirPasswordPolicy.offerLegacyRetry(PolicyLookup.unknown("x"), generic));
+            assertFalse(EdirPasswordPolicy.offerLegacyRetry(null, generic));
         }
 
         @Test
-        @DisplayName("NMAS on the cause is enough when the wrapper text dropped the word")
-        void nmasOnTheCause() {
-            LDAPException cause = new LDAPException(ResultCode.OTHER,
-                    "NMAS Change Password extension failed");
-            LDAPException wrapper = new LDAPException(ResultCode.OTHER, "Password too short", cause);
-            assertTrue(EdirPasswordPolicy.passwordModifySuggestsLegacy(wrapper));
+        @DisplayName("not offered for rights or credential failures")
+        void rights() {
+            assertFalse(EdirPasswordPolicy.offerLegacyRetry(PolicyLookup.none(),
+                    new LDAPException(ResultCode.INSUFFICIENT_ACCESS_RIGHTS, "no")));
+            assertFalse(EdirPasswordPolicy.offerLegacyRetry(PolicyLookup.none(),
+                    new LDAPException(ResultCode.INVALID_CREDENTIALS, "no")));
+            assertFalse(EdirPasswordPolicy.offerLegacyRetry(PolicyLookup.none(),
+                    new LDAPException(ResultCode.OTHER, "NMAS failed", "-16049", null)));
+            assertFalse(EdirPasswordPolicy.offerLegacyRetry(PolicyLookup.none(),
+                    new LDAPException(ResultCode.OTHER, "outer",
+                            new LDAPException(ResultCode.OTHER, "NDS", "-672", null))));
         }
 
         @Test
-        @DisplayName("a negative matched DN is an NMAS failure even when the text is not")
-        void matchedDnCode() {
-            assertTrue(EdirPasswordPolicy.passwordModifySuggestsLegacy(
-                    new LDAPException(ResultCode.OTHER, "Password too short", "-216", null)));
-            assertTrue(EdirPasswordPolicy.passwordModifySuggestsLegacy(
-                    new LDAPException(ResultCode.OTHER, "Password too short", "NDS error: too short", null)));
-            assertFalse(EdirPasswordPolicy.passwordModifySuggestsLegacy(
-                    new LDAPException(ResultCode.OTHER, "Password too short", "42", null)));
-        }
-
-        @Test
-        @DisplayName("retry only when the lookup succeeded and found no policy")
-        void retryRequiresConclusiveNone() {
-            LDAPException unwilling = new LDAPException(ResultCode.UNWILLING_TO_PERFORM, "no");
-            LDAPException constraint = new LDAPException(ResultCode.CONSTRAINT_VIOLATION, "too short");
-            PolicyLookup none = new PolicyLookup(null, true);
-            PolicyLookup applied = new PolicyLookup(
-                    new Assignment(POLICY, Source.USER, USER), true);
-            PolicyLookup unseenPartition = new PolicyLookup(null, false);
-
-            assertTrue(EdirPasswordPolicy.offerLegacyRetry(none, unwilling));
-            assertTrue(EdirPasswordPolicy.offerLegacyRetry(none, constraint));
-            assertFalse(EdirPasswordPolicy.offerLegacyRetry(applied, unwilling));
-            assertFalse(EdirPasswordPolicy.offerLegacyRetry(unseenPartition, unwilling));
-            assertFalse(EdirPasswordPolicy.offerLegacyRetry(null, unwilling));
-            assertFalse(EdirPasswordPolicy.offerLegacyRetry(none,
-                    new LDAPException(ResultCode.INSUFFICIENT_ACCESS_RIGHTS, "no rights")));
-        }
-
-        @Test
-        @DisplayName("a wrong current password or missing rights is not a legacy retry")
-        void otherFailures() {
-            assertFalse(EdirPasswordPolicy.passwordModifySuggestsLegacy(
-                    new LDAPException(ResultCode.INVALID_CREDENTIALS, "Current password is incorrect.")));
-            assertFalse(EdirPasswordPolicy.passwordModifySuggestsLegacy(
-                    new LDAPException(ResultCode.INSUFFICIENT_ACCESS_RIGHTS, "no rights")));
-            assertFalse(EdirPasswordPolicy.passwordModifySuggestsLegacy(
-                    new LDAPException(ResultCode.OTHER, "server returned other")));
-            assertFalse(EdirPasswordPolicy.passwordModifySuggestsLegacy(null));
-            assertFalse(EdirPasswordPolicy.passwordModifySuggestsLegacy(new IllegalStateException("no")));
+        @DisplayName("not offered for a non-LDAP failure")
+        void nonLdap() {
+            assertFalse(EdirPasswordPolicy.offerLegacyRetry(PolicyLookup.none(),
+                    new IllegalStateException("boom")));
         }
     }
 
     @Nested
-    @DisplayName("partition root not held on this server")
-    class PartitionVisibility {
+    @DisplayName("NMAS code extraction")
+    class Codes {
 
         @Test
-        @DisplayName("an unread closer container blocks a farther naming context")
-        void unreadCloserContainerIsNotAParentPartition() {
-            // namingContexts would report o=acme, but ou=secret sits between
-            // the user and that context and could not be read. It may be the
-            // real partition root. Do not treat o=acme as this user's partition.
-            PartitionAssessment assessment = EdirPasswordPolicy.assessPartition(List.of(
-                    new AncestorProbe("ou=secret,o=acme", false, false)));
-            assertFalse(assessment.known());
-            assertNull(assessment.partitionRootDn());
-
-            String user = "cn=alice,ou=secret,o=acme";
-            Map<String, String> map = policies(
-                    user, null,
-                    "ou=secret,o=acme", null,
-                    PARTITION, POLICY,
-                    LOGIN, OTHER);
-            PolicyLookup lookup = EdirPasswordPolicy.lookup(user, map, null, false, LOGIN);
-
-            assertNull(lookup.assignment());
-            assertFalse(lookup.conclusive());
-            String status = EdirPasswordPolicy.describeStatus(lookup, null);
-            assertFalse(status.contains("No Universal Password policy"));
-            assertTrue(status.toLowerCase().contains("partition"));
-            assertEquals(Method.UNIVERSAL_PASSWORD, EdirPasswordPolicy.defaultMethod(lookup, true));
-            assertFalse(EdirPasswordPolicy.offerLegacyRetry(lookup,
-                    new LDAPException(ResultCode.UNWILLING_TO_PERFORM, "NMAS")));
-        }
-
-        @Test
-        @DisplayName("a replica attribute closer than any naming context is the partition root")
-        void replicaBeatsAFartherNamingContext() {
-            PartitionAssessment assessment = EdirPasswordPolicy.assessPartition(List.of(
-                    new AncestorProbe(PARENT, false, true),
-                    new AncestorProbe(MIDDLE, true, true)));
-            assertTrue(assessment.known());
-            assertEquals(MIDDLE, assessment.partitionRootDn());
-
-            Map<String, String> map = policies(USER, null, PARENT, null, MIDDLE, POLICY, PARTITION, OTHER);
-            PolicyLookup lookup = EdirPasswordPolicy.lookup(USER, map, MIDDLE, true, LOGIN);
-            assertEquals(Source.PARTITION_ROOT, lookup.assignment().source());
-            assertEquals(POLICY, lookup.assignment().policyDN());
-            assertTrue(lookup.conclusive());
-        }
-
-        @Test
-        @DisplayName("a naming context is the root after closer containers are readable and are not")
-        void namingContextAfterConfirmedContainers() {
-            PartitionAssessment assessment = EdirPasswordPolicy.assessPartition(List.of(
-                    new AncestorProbe(PARENT, false, true),
-                    new AncestorProbe(MIDDLE, false, true),
-                    new AncestorProbe(PARTITION, true, true)));
-            assertTrue(assessment.known());
-            assertEquals(PARTITION, assessment.partitionRootDn());
-        }
-
-        @Test
-        @DisplayName("walking off the top without a partition root is not 'no policy'")
-        void noPartitionRootOnThisServer() {
-            PartitionAssessment assessment = EdirPasswordPolicy.assessPartition(List.of(
-                    new AncestorProbe(PARENT, false, true),
-                    new AncestorProbe(PARTITION, false, true)));
-            assertFalse(assessment.known());
-
-            PolicyLookup lookup = EdirPasswordPolicy.lookup(
-                    USER, policies(USER, null, PARENT, null, LOGIN, POLICY), null, false, LOGIN);
-            assertNull(lookup.assignment());
-            assertFalse(lookup.conclusive());
-            assertEquals(Method.UNIVERSAL_PASSWORD, EdirPasswordPolicy.defaultMethod(lookup, true));
-        }
-
-        @Test
-        @DisplayName("a user or parent policy is still conclusive when the partition is unseen")
-        void userAndContainerDoNotNeedThePartition() {
-            PolicyLookup onUser = EdirPasswordPolicy.lookup(
-                    USER, policies(USER, POLICY), null, false, LOGIN);
-            assertTrue(onUser.conclusive());
-            assertEquals(Source.USER, onUser.assignment().source());
-
-            PolicyLookup onParent = EdirPasswordPolicy.lookup(
-                    USER, policies(USER, null, PARENT, POLICY, LOGIN, OTHER), null, false, LOGIN);
-            assertTrue(onParent.conclusive());
-            assertEquals(Source.CONTAINER, onParent.assignment().source());
-            assertEquals(POLICY, onParent.assignment().policyDN());
-            assertEquals(Method.UNIVERSAL_PASSWORD, EdirPasswordPolicy.defaultMethod(onParent, true));
+        @DisplayName("from a response control, then the matched DN")
+        void sources() {
+            byte[] code = {(byte) 0xFF, (byte) 0xFF, (byte) 0xC1, (byte) 0x4F}; // -16049
+            Control control = new Control(EdirPasswordPolicy.NMAS_CONTROL_PREFIX + "1", false,
+                    new ASN1OctetString(code));
+            assertEquals(-16049, EdirPasswordPolicy.nmasCode(new Control[] {control}, null));
+            assertEquals(-216, EdirPasswordPolicy.nmasCode(null, " -216 "));
+            assertNull(EdirPasswordPolicy.nmasCode(null, "cn=x"));
+            assertNull(EdirPasswordPolicy.nmasCode((Throwable) null));
         }
     }
 
-    @Nested
-    @DisplayName("secure connection")
-    class SecureConnection {
-
-        @Test
-        @DisplayName("a connected socket counts only when TLS is actually on")
-        void liveSocket() {
-            assertTrue(EdirPasswordPolicy.connectionIsSecure(true, true, false, 389));
-            assertFalse(EdirPasswordPolicy.connectionIsSecure(true, false, true, 636));
-            assertFalse(EdirPasswordPolicy.connectionIsSecure(true, false, false, 389));
-        }
-
-        @Test
-        @DisplayName("before connect, LDAPS config counts")
-        void configOnly() {
-            assertTrue(EdirPasswordPolicy.connectionIsSecure(false, false, true, 389));
-            assertTrue(EdirPasswordPolicy.connectionIsSecure(false, false, false, 636));
-            assertFalse(EdirPasswordPolicy.connectionIsSecure(false, false, false, 389));
-        }
+    @Test
+    @DisplayName("a connected socket is secure only when TLS is active")
+    void secureConnection() {
+        assertTrue(EdirPasswordPolicy.connectionIsSecure(true, true, false, 389));
+        assertFalse(EdirPasswordPolicy.connectionIsSecure(true, false, true, 636));
+        assertTrue(EdirPasswordPolicy.connectionIsSecure(false, false, true, 389));
+        assertTrue(EdirPasswordPolicy.connectionIsSecure(false, false, false, 636));
+        assertFalse(EdirPasswordPolicy.connectionIsSecure(false, false, false, 389));
     }
 }
