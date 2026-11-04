@@ -1,7 +1,10 @@
 package com.pointbluetech.arborj.util;
 
+import com.pointbluetech.arborj.util.EdirPasswordPolicy.AncestorProbe;
 import com.pointbluetech.arborj.util.EdirPasswordPolicy.Assignment;
 import com.pointbluetech.arborj.util.EdirPasswordPolicy.Method;
+import com.pointbluetech.arborj.util.EdirPasswordPolicy.PartitionAssessment;
+import com.pointbluetech.arborj.util.EdirPasswordPolicy.PolicyLookup;
 import com.pointbluetech.arborj.util.EdirPasswordPolicy.Source;
 import com.unboundid.asn1.ASN1OctetString;
 import com.unboundid.ldap.sdk.Control;
@@ -229,34 +232,36 @@ class EdirPasswordPolicyTest {
     class DialogDecisions {
 
         private final Assignment policy = new Assignment(POLICY, Source.USER, USER);
+        private final PolicyLookup found = new PolicyLookup(policy, true);
+        private final PolicyLookup none = new PolicyLookup(null, true);
 
         @Test
         @DisplayName("a found policy is shown and Password Modify stays selected")
         void policyFound() {
-            String status = EdirPasswordPolicy.describeStatus(policy, null);
+            String status = EdirPasswordPolicy.describeStatus(found, null);
             assertTrue(status.startsWith("Universal Password policy applies. "));
             assertTrue(status.contains("Assigned to this user."));
-            assertFalse(EdirPasswordPolicy.offerMethodChoice(policy));
+            assertFalse(EdirPasswordPolicy.offerMethodChoice(found));
             assertEquals(Method.UNIVERSAL_PASSWORD,
-                    EdirPasswordPolicy.defaultMethod(policy, false, true));
+                    EdirPasswordPolicy.defaultMethod(found, true));
         }
 
         @Test
         @DisplayName("no policy offers the choice and defaults to legacy on LDAPS")
         void noPolicyDefaultsToLegacyWhenSecure() {
-            String status = EdirPasswordPolicy.describeStatus(null, null);
+            String status = EdirPasswordPolicy.describeStatus(none, null);
             assertTrue(status.contains("No Universal Password policy"));
             assertTrue(status.contains("Login Policy"));
-            assertTrue(EdirPasswordPolicy.offerMethodChoice(null));
+            assertTrue(EdirPasswordPolicy.offerMethodChoice(none));
             assertEquals(Method.LEGACY_NDS,
-                    EdirPasswordPolicy.defaultMethod(null, false, true));
+                    EdirPasswordPolicy.defaultMethod(none, true));
         }
 
         @Test
         @DisplayName("no policy on a cleartext connection keeps Password Modify")
         void noPolicyOnCleartextStaysUniversal() {
             assertEquals(Method.UNIVERSAL_PASSWORD,
-                    EdirPasswordPolicy.defaultMethod(null, false, false));
+                    EdirPasswordPolicy.defaultMethod(none, false));
         }
 
         @Test
@@ -267,7 +272,7 @@ class EdirPasswordPolicyTest {
             assertTrue(status.contains("insufficient access"));
             assertTrue(EdirPasswordPolicy.offerMethodChoice(null));
             assertEquals(Method.UNIVERSAL_PASSWORD,
-                    EdirPasswordPolicy.defaultMethod(null, true, true));
+                    EdirPasswordPolicy.defaultMethod(null, true));
         }
 
         @Test
@@ -326,6 +331,25 @@ class EdirPasswordPolicyTest {
         }
 
         @Test
+        @DisplayName("retry only when the lookup succeeded and found no policy")
+        void retryRequiresConclusiveNone() {
+            LDAPException unwilling = new LDAPException(ResultCode.UNWILLING_TO_PERFORM, "no");
+            LDAPException constraint = new LDAPException(ResultCode.CONSTRAINT_VIOLATION, "too short");
+            PolicyLookup none = new PolicyLookup(null, true);
+            PolicyLookup applied = new PolicyLookup(
+                    new Assignment(POLICY, Source.USER, USER), true);
+            PolicyLookup unseenPartition = new PolicyLookup(null, false);
+
+            assertTrue(EdirPasswordPolicy.offerLegacyRetry(none, unwilling));
+            assertTrue(EdirPasswordPolicy.offerLegacyRetry(none, constraint));
+            assertFalse(EdirPasswordPolicy.offerLegacyRetry(applied, unwilling));
+            assertFalse(EdirPasswordPolicy.offerLegacyRetry(unseenPartition, unwilling));
+            assertFalse(EdirPasswordPolicy.offerLegacyRetry(null, unwilling));
+            assertFalse(EdirPasswordPolicy.offerLegacyRetry(none,
+                    new LDAPException(ResultCode.INSUFFICIENT_ACCESS_RIGHTS, "no rights")));
+        }
+
+        @Test
         @DisplayName("a wrong current password or missing rights is not a legacy retry")
         void otherFailures() {
             assertFalse(EdirPasswordPolicy.passwordModifySuggestsLegacy(
@@ -336,6 +360,98 @@ class EdirPasswordPolicyTest {
                     new LDAPException(ResultCode.OTHER, "server returned other")));
             assertFalse(EdirPasswordPolicy.passwordModifySuggestsLegacy(null));
             assertFalse(EdirPasswordPolicy.passwordModifySuggestsLegacy(new IllegalStateException("no")));
+        }
+    }
+
+    @Nested
+    @DisplayName("partition root not held on this server")
+    class PartitionVisibility {
+
+        @Test
+        @DisplayName("an unread closer container blocks a farther naming context")
+        void unreadCloserContainerIsNotAParentPartition() {
+            // namingContexts would report o=acme, but ou=secret sits between
+            // the user and that context and could not be read. It may be the
+            // real partition root. Do not treat o=acme as this user's partition.
+            PartitionAssessment assessment = EdirPasswordPolicy.assessPartition(List.of(
+                    new AncestorProbe("ou=secret,o=acme", false, false)));
+            assertFalse(assessment.known());
+            assertNull(assessment.partitionRootDn());
+
+            String user = "cn=alice,ou=secret,o=acme";
+            Map<String, String> map = policies(
+                    user, null,
+                    "ou=secret,o=acme", null,
+                    PARTITION, POLICY,
+                    LOGIN, OTHER);
+            PolicyLookup lookup = EdirPasswordPolicy.lookup(user, map, null, false, LOGIN);
+
+            assertNull(lookup.assignment());
+            assertFalse(lookup.conclusive());
+            String status = EdirPasswordPolicy.describeStatus(lookup, null);
+            assertFalse(status.contains("No Universal Password policy"));
+            assertTrue(status.toLowerCase().contains("partition"));
+            assertEquals(Method.UNIVERSAL_PASSWORD, EdirPasswordPolicy.defaultMethod(lookup, true));
+            assertFalse(EdirPasswordPolicy.offerLegacyRetry(lookup,
+                    new LDAPException(ResultCode.UNWILLING_TO_PERFORM, "NMAS")));
+        }
+
+        @Test
+        @DisplayName("a replica attribute closer than any naming context is the partition root")
+        void replicaBeatsAFartherNamingContext() {
+            PartitionAssessment assessment = EdirPasswordPolicy.assessPartition(List.of(
+                    new AncestorProbe(PARENT, false, true),
+                    new AncestorProbe(MIDDLE, true, true)));
+            assertTrue(assessment.known());
+            assertEquals(MIDDLE, assessment.partitionRootDn());
+
+            Map<String, String> map = policies(USER, null, PARENT, null, MIDDLE, POLICY, PARTITION, OTHER);
+            PolicyLookup lookup = EdirPasswordPolicy.lookup(USER, map, MIDDLE, true, LOGIN);
+            assertEquals(Source.PARTITION_ROOT, lookup.assignment().source());
+            assertEquals(POLICY, lookup.assignment().policyDN());
+            assertTrue(lookup.conclusive());
+        }
+
+        @Test
+        @DisplayName("a naming context is the root after closer containers are readable and are not")
+        void namingContextAfterConfirmedContainers() {
+            PartitionAssessment assessment = EdirPasswordPolicy.assessPartition(List.of(
+                    new AncestorProbe(PARENT, false, true),
+                    new AncestorProbe(MIDDLE, false, true),
+                    new AncestorProbe(PARTITION, true, true)));
+            assertTrue(assessment.known());
+            assertEquals(PARTITION, assessment.partitionRootDn());
+        }
+
+        @Test
+        @DisplayName("walking off the top without a partition root is not 'no policy'")
+        void noPartitionRootOnThisServer() {
+            PartitionAssessment assessment = EdirPasswordPolicy.assessPartition(List.of(
+                    new AncestorProbe(PARENT, false, true),
+                    new AncestorProbe(PARTITION, false, true)));
+            assertFalse(assessment.known());
+
+            PolicyLookup lookup = EdirPasswordPolicy.lookup(
+                    USER, policies(USER, null, PARENT, null, LOGIN, POLICY), null, false, LOGIN);
+            assertNull(lookup.assignment());
+            assertFalse(lookup.conclusive());
+            assertEquals(Method.UNIVERSAL_PASSWORD, EdirPasswordPolicy.defaultMethod(lookup, true));
+        }
+
+        @Test
+        @DisplayName("a user or parent policy is still conclusive when the partition is unseen")
+        void userAndContainerDoNotNeedThePartition() {
+            PolicyLookup onUser = EdirPasswordPolicy.lookup(
+                    USER, policies(USER, POLICY), null, false, LOGIN);
+            assertTrue(onUser.conclusive());
+            assertEquals(Source.USER, onUser.assignment().source());
+
+            PolicyLookup onParent = EdirPasswordPolicy.lookup(
+                    USER, policies(USER, null, PARENT, POLICY, LOGIN, OTHER), null, false, LOGIN);
+            assertTrue(onParent.conclusive());
+            assertEquals(Source.CONTAINER, onParent.assignment().source());
+            assertEquals(POLICY, onParent.assignment().policyDN());
+            assertEquals(Method.UNIVERSAL_PASSWORD, EdirPasswordPolicy.defaultMethod(onParent, true));
         }
     }
 

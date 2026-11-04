@@ -639,6 +639,9 @@ public class LDAPService {
             throw new LDAPException(ResultCode.CONSTRAINT_VIOLATION,
                     "New password must not be empty.");
         }
+        // Connect first, then judge the live socket. A disconnected config
+        // with useTLS or port 636 must not count as a secure channel.
+        ensureWritable();
         if (!isSecureConnection()) {
             throw new LDAPException(ResultCode.CONFIDENTIALITY_REQUIRED,
                     "Legacy NDS password changes replace userPassword and require "
@@ -648,13 +651,15 @@ public class LDAPService {
     }
 
     /**
-     * Read-only: which Universal Password policy applies to {@code userDN},
-     * or null when nothing is assigned. Reads {@code nspmPasswordPolicyDN}
-     * on the user, the parent container, the partition root, and the Login
-     * Policy object. Does not modify the directory and does not require a
-     * writable connection.
+     * Read-only: which Universal Password policy applies to {@code userDN}.
+     * Reads {@code nspmPasswordPolicyDN} on the user, the parent container,
+     * the partition root, and the Login Policy object. The partition root is
+     * the nearest ancestor that is a naming context or carries a
+     * {@code replica} attribute. When that root is not visible on this
+     * server, the lookup is not a conclusive "no policy". Does not modify
+     * the directory and does not require a writable connection.
      */
-    public EdirPasswordPolicy.Assignment findUniversalPasswordPolicy(String userDN)
+    public EdirPasswordPolicy.PolicyLookup findUniversalPasswordPolicy(String userDN)
             throws LDAPException {
         ensureConnected();
         List<String> contexts = fetchNamingContexts();
@@ -662,27 +667,41 @@ public class LDAPService {
         Map<String, String> policies = new LinkedHashMap<>();
         SearchResultEntry user = readEntryRequired(userDN, EdirPasswordPolicy.POLICY_ATTRIBUTE);
         policies.put(userDN, attributeOrNull(user, EdirPasswordPolicy.POLICY_ATTRIBUTE));
-        // The user's own assignment wins. Don't let an unreadable container
-        // or Login Policy hide a policy we already have.
+        // The user's own assignment wins. Don't walk containers we may not
+        // be allowed to read before reporting it.
         if (policies.get(userDN) != null) {
-            return EdirPasswordPolicy.resolve(userDN, policies, contexts, null);
+            return EdirPasswordPolicy.lookup(userDN, policies, null, false, null);
         }
 
-        List<String> toRead = EdirPasswordPolicy.policySearchDns(userDN, contexts);
-        LDAPException accessDenied = null;
-        // Index 0 is the user, already read above. An entry we cannot read
-        // is skipped so a later hit (the partition root, the Login Policy)
-        // is not hidden, and is reported only when nothing was found.
-        for (int i = 1; i < toRead.size(); i++) {
-            String dn = toRead.get(i);
+        String parent = EdirPasswordPolicy.parentDn(userDN);
+        if (parent != null) {
+            SearchResultEntry parentEntry = readEntryIfPresent(parent, EdirPasswordPolicy.POLICY_ATTRIBUTE);
+            policies.put(parent, parentEntry == null
+                    ? null
+                    : attributeOrNull(parentEntry, EdirPasswordPolicy.POLICY_ATTRIBUTE));
+            if (policies.get(parent) != null) {
+                return EdirPasswordPolicy.lookup(userDN, policies, null, false, null);
+            }
+        }
+
+        EdirPasswordPolicy.PartitionAssessment partition =
+                EdirPasswordPolicy.assessPartition(probePartitionAncestors(userDN, contexts));
+        if (!partition.known()) {
+            return new EdirPasswordPolicy.PolicyLookup(null, false);
+        }
+
+        String root = partition.partitionRootDn();
+        if (root != null && (parent == null || !EdirPasswordPolicy.sameDn(root, parent))) {
             try {
-                SearchResultEntry entry = readEntryIfPresent(dn, EdirPasswordPolicy.POLICY_ATTRIBUTE);
-                policies.put(dn, entry == null
+                SearchResultEntry rootEntry = readEntryIfPresent(root, EdirPasswordPolicy.POLICY_ATTRIBUTE);
+                policies.put(root, rootEntry == null
                         ? null
-                        : attributeOrNull(entry, EdirPasswordPolicy.POLICY_ATTRIBUTE));
+                        : attributeOrNull(rootEntry, EdirPasswordPolicy.POLICY_ATTRIBUTE));
             } catch (LDAPException e) {
-                if (e.getResultCode() != ResultCode.INSUFFICIENT_ACCESS_RIGHTS) throw e;
-                accessDenied = e;
+                if (e.getResultCode() == ResultCode.INSUFFICIENT_ACCESS_RIGHTS) {
+                    return new EdirPasswordPolicy.PolicyLookup(null, false);
+                }
+                throw e;
             }
         }
 
@@ -694,14 +713,61 @@ public class LDAPService {
                 policies.put(loginDN, attributeOrNull(login, EdirPasswordPolicy.POLICY_ATTRIBUTE));
             }
         } catch (LDAPException e) {
-            if (e.getResultCode() != ResultCode.INSUFFICIENT_ACCESS_RIGHTS) throw e;
-            accessDenied = e;
+            if (e.getResultCode() == ResultCode.INSUFFICIENT_ACCESS_RIGHTS) {
+                // A policy already read on the partition root still applies.
+                // Not being able to read the Login Policy only matters when
+                // nothing closer was assigned.
+                EdirPasswordPolicy.PolicyLookup soFar =
+                        EdirPasswordPolicy.lookup(userDN, policies, root, true, null);
+                if (soFar.assignment() != null) return soFar;
+                return new EdirPasswordPolicy.PolicyLookup(null, false);
+            }
+            throw e;
         }
+        return EdirPasswordPolicy.lookup(userDN, policies, root, true, loginDN);
+    }
 
-        EdirPasswordPolicy.Assignment found =
-                EdirPasswordPolicy.resolve(userDN, policies, contexts, loginDN);
-        if (found == null && accessDenied != null) throw accessDenied;
-        return found;
+    /**
+     * Ancestors from the parent upward. A naming context is a partition root
+     * this server holds. Any closer container is checked for the operational
+     * {@code replica} attribute, which marks a partition root even when
+     * namingContexts omitted it. An unreadable ancestor ends the walk.
+     */
+    private List<EdirPasswordPolicy.AncestorProbe> probePartitionAncestors(
+            String userDN, List<String> namingContexts) throws LDAPException {
+        List<EdirPasswordPolicy.AncestorProbe> probes = new ArrayList<>();
+        String current = EdirPasswordPolicy.parentDn(userDN);
+        while (current != null) {
+            if (EdirPasswordPolicy.isNamingContext(current, namingContexts)) {
+                probes.add(new EdirPasswordPolicy.AncestorProbe(current, true, true));
+                break;
+            }
+            try {
+                SearchResultEntry entry = connection.getEntry(current, "replica");
+                if (entry == null) {
+                    probes.add(new EdirPasswordPolicy.AncestorProbe(current, false, false));
+                    break;
+                }
+                boolean replica = entry.hasAttribute("replica");
+                probes.add(new EdirPasswordPolicy.AncestorProbe(current, replica, true));
+                if (replica) break;
+            } catch (LDAPException e) {
+                ResultCode rc = e.getResultCode();
+                if (rc == ResultCode.NO_SUCH_ATTRIBUTE) {
+                    probes.add(new EdirPasswordPolicy.AncestorProbe(current, false, true));
+                } else if (rc == ResultCode.NO_SUCH_OBJECT
+                        || rc == ResultCode.REFERRAL
+                        || rc == ResultCode.INSUFFICIENT_ACCESS_RIGHTS
+                        || rc == ResultCode.INVALID_DN_SYNTAX) {
+                    probes.add(new EdirPasswordPolicy.AncestorProbe(current, false, false));
+                    break;
+                } else {
+                    throw e;
+                }
+            }
+            current = EdirPasswordPolicy.parentDn(current);
+        }
+        return probes;
     }
 
     /**

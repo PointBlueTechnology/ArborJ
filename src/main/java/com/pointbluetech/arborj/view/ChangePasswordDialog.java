@@ -20,8 +20,9 @@ import javafx.scene.text.Font;
  *   {@code nspmPasswordPolicyDN} on the user, the parent container, the
  *   partition root, or the Login Policy). When none applies, the user
  *   chooses Universal Password (RFC 3062) or Legacy NDS (replace
- *   {@code userPassword} over LDAPS). Password Modify failures 53 / 19 /
- *   NMAS offer a legacy retry.
+ *   {@code userPassword} over LDAPS). A Password Modify failure offers
+ *   that legacy replace only when the policy lookup succeeded and found
+ *   no policy. The writes run off the JavaFX thread.
  * - Generic / OpenLDAP: RFC 3062 Password Modify. Supports self-service
  *   (current + new password) and administrative reset (new password only —
  *   uses the connected admin's rights).
@@ -55,6 +56,12 @@ public class ChangePasswordDialog extends Dialog<Void> {
     private final VBox methodBox = new VBox(4);
     private final Label legacySecureHint = new Label(
             "Legacy NDS replaces userPassword and needs an LDAPS connection.");
+    private final Label legacyNoVerifyHint = new Label(
+            "Legacy NDS does not verify the current password. It replaces userPassword using the bound account's rights.");
+
+    /** Set on the JavaFX thread when the policy read finishes. Null if it failed. */
+    private EdirPasswordPolicy.PolicyLookup policyLookup;
+    private Button okButton;
 
     // AD-specific controls
     private final CheckBox mustChangeCheckbox = new CheckBox("User must change password at next logon");
@@ -97,7 +104,8 @@ public class ChangePasswordDialog extends Dialog<Void> {
         ButtonType cancelType = new ButtonType("Cancel", ButtonBar.ButtonData.CANCEL_CLOSE);
         getDialogPane().getButtonTypes().addAll(okType, cancelType);
 
-        Button okBtn = (Button) getDialogPane().lookupButton(okType);
+        okButton = (Button) getDialogPane().lookupButton(okType);
+        Button okBtn = okButton;
         // addEventFilter (not setOnAction): JavaFX runs filters before the
         // Dialog's internal action that closes the pane, so consuming here
         // keeps the dialog open. setOnAction runs after the close filter,
@@ -163,7 +171,10 @@ public class ChangePasswordDialog extends Dialog<Void> {
             legacySecureHint.setStyle("-fx-font-size: 11px;");
             legacySecureHint.setVisible(false);
             legacySecureHint.setManaged(false);
-            methodBox.getChildren().addAll(methodLabel, universalRadio, legacyRadio, legacySecureHint);
+            legacyNoVerifyHint.setWrapText(true);
+            legacyNoVerifyHint.setStyle("-fx-font-size: 11px;");
+            methodBox.getChildren().addAll(
+                    methodLabel, universalRadio, legacyRadio, legacyNoVerifyHint, legacySecureHint);
             // Hidden until the policy read finishes. Shown only when no
             // Universal Password policy applies.
             methodBox.setVisible(false);
@@ -291,56 +302,72 @@ public class ChangePasswordDialog extends Dialog<Void> {
             return;
         }
 
-        try {
-            switch (dirType) {
-                case ACTIVE_DIRECTORY -> {
-                    controller.getLdapService().changePasswordAD(targetDN, newPassword);
-                    // Only touch userAccountControl when we successfully read
-                    // the existing value first — otherwise a REPLACE based on
-                    // currentUAC=0 would wipe account-type bits and ACCOUNTDISABLE.
-                    if (uacFetched) {
-                        controller.getLdapService().updateADPasswordFlags(
-                                targetDN,
-                                mustChangeCheckbox.isSelected(),
-                                neverExpiresCheckbox.isSelected(),
-                                currentUAC);
+        // Read every control here. The write itself runs off the JavaFX thread.
+        boolean legacy = legacyRadio.isSelected();
+        String oldPassword = effectiveOldPassword();
+        boolean mustChange = mustChangeCheckbox.isSelected();
+        boolean neverExpires = neverExpiresCheckbox.isSelected();
+        boolean applyUac = uacFetched;
+        int uac = currentUAC;
+        EdirPasswordPolicy.PolicyLookup lookup = policyLookup;
+
+        okButton.setDisable(true);
+        Thread.ofVirtual().start(() -> {
+            try {
+                writePassword(dirType, newPassword, oldPassword, legacy,
+                        mustChange, neverExpires, applyUac, uac);
+                Platform.runLater(this::close);
+            } catch (Exception ex) {
+                Platform.runLater(() -> {
+                    okButton.setDisable(false);
+                    // formatPasswordError's text is the exception message.
+                    // A legacy retry is only for a conclusive "no policy".
+                    String msg = messageOf(ex);
+                    if (dirType == DirectoryType.EDIRECTORY
+                            && !legacy
+                            && EdirPasswordPolicy.offerLegacyRetry(lookup, ex)) {
+                        offerLegacyRetry(newPassword, msg);
+                        return;
                     }
-                }
-                case EDIRECTORY -> {
-                    if (legacyRadio.isSelected()) {
-                        controller.getLdapService().changePasswordLegacyNDS(targetDN, newPassword);
-                    } else {
-                        controller.getLdapService().changePasswordEDir(
-                                targetDN, effectiveOldPassword(), newPassword);
-                    }
-                }
-                default -> {
-                    // Generic / OpenLDAP -- RFC 3062
-                    controller.getLdapService().changePasswordRFC3062(
-                            targetDN, effectiveOldPassword(), newPassword);
+                    showError(msg);
+                });
+            }
+        });
+    }
+
+    private void writePassword(DirectoryType dirType, String newPassword, String oldPassword,
+                               boolean legacy, boolean mustChange, boolean neverExpires,
+                               boolean applyUac, int uac) throws Exception {
+        switch (dirType) {
+            case ACTIVE_DIRECTORY -> {
+                controller.getLdapService().changePasswordAD(targetDN, newPassword);
+                // Only touch userAccountControl when we successfully read
+                // the existing value first — otherwise a REPLACE based on
+                // currentUAC=0 would wipe account-type bits and ACCOUNTDISABLE.
+                if (applyUac) {
+                    controller.getLdapService().updateADPasswordFlags(
+                            targetDN, mustChange, neverExpires, uac);
                 }
             }
-            close();
-        } catch (Exception ex) {
-            // The service already prefixes its message with "Password change
-            // failed:" and includes the LDAP result code; don't double-prefix.
-            String msg = messageOf(ex);
-            if (dirType == DirectoryType.EDIRECTORY
-                    && !legacyRadio.isSelected()
-                    && EdirPasswordPolicy.passwordModifySuggestsLegacy(ex)) {
-                offerLegacyRetry(msg);
-                return;
+            case EDIRECTORY -> {
+                if (legacy) {
+                    controller.getLdapService().changePasswordLegacyNDS(targetDN, newPassword);
+                } else {
+                    controller.getLdapService().changePasswordEDir(targetDN, oldPassword, newPassword);
+                }
             }
-            showError(msg);
+            default -> controller.getLdapService().changePasswordRFC3062(
+                    targetDN, oldPassword, newPassword);
         }
     }
 
     /**
-     * Password Modify failed in the way a legacy-only tree fails (53, 19,
-     * or an NMAS error). Ask before replacing {@code userPassword}. A
-     * cleartext connection cannot do that replace, so the error stands.
+     * Password Modify failed and the lookup had already found no Universal
+     * Password policy. Ask before replacing {@code userPassword}. The
+     * replace runs off the JavaFX thread. A cleartext connection cannot do
+     * it, so the Password Modify error stands.
      */
-    private void offerLegacyRetry(String message) {
+    private void offerLegacyRetry(String newPassword, String message) {
         if (!controller.getLdapService().isSecureConnection()) {
             showError(message
                     + "\n\nA legacy NDS replace was not attempted because this "
@@ -351,34 +378,41 @@ public class ChangePasswordDialog extends Dialog<Void> {
         alert.setTitle("Retry with Legacy NDS Password");
         alert.setHeaderText("Retry by replacing userPassword?");
         alert.setContentText(message
-                + "\n\nPassword Modify was rejected. Retry with Legacy NDS "
+                + "\n\nNo Universal Password policy applies. Retry with Legacy NDS "
                 + "(replace userPassword over this LDAPS connection)? "
-                + "That is the modify Apache Directory Studio sends, and it "
-                + "does not go through Universal Password.");
+                + "That does not verify the current password and does not go "
+                + "through Universal Password.");
         alert.getButtonTypes().setAll(ButtonType.YES, ButtonType.NO);
         var window = ownerWindow();
         if (window != null) alert.initOwner(window);
         var choice = alert.showAndWait();
         if (choice.isEmpty() || choice.get() != ButtonType.YES) return;
-        try {
-            controller.getLdapService().changePasswordLegacyNDS(targetDN, newPasswordField.getText());
-            close();
-        } catch (Exception retryEx) {
-            showError(messageOf(retryEx));
-        }
+
+        okButton.setDisable(true);
+        Thread.ofVirtual().start(() -> {
+            try {
+                controller.getLdapService().changePasswordLegacyNDS(targetDN, newPassword);
+                Platform.runLater(this::close);
+            } catch (Exception retryEx) {
+                Platform.runLater(() -> {
+                    okButton.setDisable(false);
+                    showError(messageOf(retryEx));
+                });
+            }
+        });
     }
 
     private void loadEdirPolicy(Button okBtn) {
         Thread.ofVirtual().start(() -> {
-            EdirPasswordPolicy.Assignment assignment = null;
+            EdirPasswordPolicy.PolicyLookup lookup = null;
             String failure = null;
             try {
-                assignment = controller.getLdapService().findUniversalPasswordPolicy(targetDN);
+                lookup = controller.getLdapService().findUniversalPasswordPolicy(targetDN);
             } catch (Exception e) {
                 failure = e.getMessage() == null || e.getMessage().isBlank()
                         ? e.toString() : e.getMessage();
             }
-            EdirPasswordPolicy.Assignment found = assignment;
+            EdirPasswordPolicy.PolicyLookup found = lookup;
             String error = failure;
             boolean secure = false;
             try {
@@ -388,13 +422,17 @@ public class ChangePasswordDialog extends Dialog<Void> {
             }
             boolean secureConnection = secure;
             Platform.runLater(() -> {
-                policyStatusLabel.setText(EdirPasswordPolicy.describeStatus(found, error));
-                boolean hasPolicy = found != null;
-                policyDnLabel.setText(hasPolicy ? found.policyDN() : "");
+                // A failed read is not a lookup result. Leave policyLookup null
+                // so a later Password Modify error is shown as-is.
+                policyLookup = error == null ? found : null;
+                EdirPasswordPolicy.PolicyLookup forUi = policyLookup;
+                policyStatusLabel.setText(EdirPasswordPolicy.describeStatus(forUi, error));
+                boolean hasPolicy = forUi != null && forUi.assignment() != null;
+                policyDnLabel.setText(hasPolicy ? forUi.assignment().policyDN() : "");
                 policyDnLabel.setVisible(hasPolicy);
                 policyDnLabel.setManaged(hasPolicy);
 
-                boolean offer = EdirPasswordPolicy.offerMethodChoice(found);
+                boolean offer = EdirPasswordPolicy.offerMethodChoice(forUi);
                 methodBox.setVisible(offer);
                 methodBox.setManaged(offer);
                 legacyRadio.setDisable(!secureConnection);
@@ -402,7 +440,7 @@ public class ChangePasswordDialog extends Dialog<Void> {
                 legacySecureHint.setManaged(offer && !secureConnection);
 
                 EdirPasswordPolicy.Method method = EdirPasswordPolicy.defaultMethod(
-                        found, error != null, secureConnection);
+                        forUi, secureConnection);
                 if (method == EdirPasswordPolicy.Method.LEGACY_NDS) {
                     legacyRadio.setSelected(true);
                 } else {

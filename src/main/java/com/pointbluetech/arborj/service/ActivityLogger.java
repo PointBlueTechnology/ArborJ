@@ -15,6 +15,7 @@ import java.time.format.DateTimeFormatter;
 import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.prefs.Preferences;
@@ -265,12 +266,26 @@ public final class ActivityLogger {
         }
     }
 
+    /** Password values are never written to the log, even if the mask list is cleared. */
+    private static final Set<String> ALWAYS_MASKED = Set.of("userpassword", "unicodepwd");
+
     private String maskValue(String attributeName, String value) {
         if (attributeName == null || value == null) return value;
-        if (maskedAttributesLower.contains(attributeName.toLowerCase())) {
+        String base = attributeBaseName(attributeName);
+        String full = attributeName.trim().toLowerCase(Locale.ROOT);
+        if (ALWAYS_MASKED.contains(base)
+                || maskedAttributesLower.contains(base)
+                || maskedAttributesLower.contains(full)) {
             return "****";
         }
         return value;
+    }
+
+    /** Attribute type without options ({@code userPassword;binary} → {@code userpassword}). */
+    static String attributeBaseName(String attributeName) {
+        int semi = attributeName.indexOf(';');
+        String base = semi >= 0 ? attributeName.substring(0, semi) : attributeName;
+        return base.trim().toLowerCase(Locale.ROOT);
     }
 
     private static Set<String> parseMasked(String raw) {
