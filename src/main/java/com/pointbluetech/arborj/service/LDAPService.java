@@ -4,6 +4,7 @@ import com.pointbluetech.arborj.model.CertificateDetails;
 import com.pointbluetech.arborj.model.EffectiveRights;
 import com.pointbluetech.arborj.model.LDAPConnectionConfig;
 import com.pointbluetech.arborj.model.LDAPEntry;
+import com.pointbluetech.arborj.util.EdirPasswordPolicy;
 import com.unboundid.ldap.sdk.*;
 import com.unboundid.ldap.sdk.controls.SimplePagedResultsControl;
 import com.unboundid.ldap.sdk.extensions.PasswordModifyExtendedRequest;
@@ -493,9 +494,12 @@ public class LDAPService {
      * leaves the actual reason in the LDAP result code or in the matched-DN
      * field. We surface all available pieces so the user can see the real
      * cause (too short, unique-policy violation, password expired, etc.).
+     *
+     * <p>Package-visible so unit tests can lock this wording. The dialog
+     * shows the string as-is.
      */
-    private static String formatPasswordError(ResultCode rc, String diagnostic,
-                                              String matchedDN, Control[] controls) {
+    static String formatPasswordError(ResultCode rc, String diagnostic,
+                                      String matchedDN, Control[] controls) {
         StringBuilder sb = new StringBuilder("Password change failed: ");
 
         // Try to find a more specific reason than the generic NMAS message.
@@ -548,7 +552,7 @@ public class LDAPService {
         // 2.16.840.1.113719.1.27.103.* — the value typically encodes a
         // 32-bit signed NMAS error code as the first 4 BE bytes.
         for (Control c : controls) {
-            if (c.getOID() != null && c.getOID().startsWith("2.16.840.1.113719.1.27.103.")) {
+            if (c.getOID() != null && c.getOID().startsWith(EdirPasswordPolicy.NMAS_CONTROL_PREFIX)) {
                 ASN1OctetString val = c.getValue();
                 if (val == null) continue;
                 byte[] bytes = val.getValue();
@@ -567,7 +571,8 @@ public class LDAPService {
      * Map well-known NMAS / NDS error codes to human-readable text. Codes are
      * defined in eDirectory's nmasapi.h (negative values).
      */
-    private static String decodeNmasCode(int code) {
+    /** Package-visible so unit tests can lock the NMAS code map. */
+    static String decodeNmasCode(int code) {
         return switch (code) {
             case -215 -> "Password unique violation (matches a previous password)";
             case -216 -> "Password too short";
@@ -613,12 +618,219 @@ public class LDAPService {
     }
 
     /**
-     * eDirectory DirXML password change (universal password).
+     * eDirectory Universal Password change. This is the RFC 3062 Password
+     * Modify extended operation (NMAS). Trees with only legacy NDS password
+     * rules reject it; use {@link #changePasswordLegacyNDS} there.
      */
     public void changePasswordEDir(String dn, String oldPassword, String newPassword)
             throws LDAPException {
-        // eDirectory uses RFC 3062 but may also support DirXML extended op
         changePasswordRFC3062(dn, oldPassword, newPassword);
+    }
+
+    /**
+     * Legacy NDS password set: REPLACE {@code userPassword}. This is the
+     * modify Apache Directory Studio sends, and it is what succeeds on an
+     * eDirectory tree that has no Universal Password policy. eDirectory
+     * accepts a cleartext {@code userPassword} only on a secure connection,
+     * so a plaintext socket is refused before the modify is sent.
+     */
+    public void changePasswordLegacyNDS(String dn, String newPassword) throws LDAPException {
+        if (newPassword == null || newPassword.isEmpty()) {
+            throw new LDAPException(ResultCode.CONSTRAINT_VIOLATION,
+                    "New password must not be empty.");
+        }
+        if (!isSecureConnection()) {
+            throw new LDAPException(ResultCode.CONFIDENTIALITY_REQUIRED,
+                    "Legacy NDS password changes replace userPassword and require "
+                            + "a secure connection (LDAPS).");
+        }
+        modifyAttribute(dn, "userPassword", LDAPModifyOperation.REPLACE, List.of(newPassword));
+    }
+
+    /**
+     * Read-only: which Universal Password policy applies to {@code userDN},
+     * or null when nothing is assigned. Reads {@code nspmPasswordPolicyDN}
+     * on the user, the parent container, the partition root, and the Login
+     * Policy object. Does not modify the directory and does not require a
+     * writable connection.
+     */
+    public EdirPasswordPolicy.Assignment findUniversalPasswordPolicy(String userDN)
+            throws LDAPException {
+        ensureConnected();
+        List<String> contexts = fetchNamingContexts();
+
+        Map<String, String> policies = new LinkedHashMap<>();
+        SearchResultEntry user = readEntryRequired(userDN, EdirPasswordPolicy.POLICY_ATTRIBUTE);
+        policies.put(userDN, attributeOrNull(user, EdirPasswordPolicy.POLICY_ATTRIBUTE));
+        // The user's own assignment wins. Don't let an unreadable container
+        // or Login Policy hide a policy we already have.
+        if (policies.get(userDN) != null) {
+            return EdirPasswordPolicy.resolve(userDN, policies, contexts, null);
+        }
+
+        List<String> toRead = EdirPasswordPolicy.policySearchDns(userDN, contexts);
+        LDAPException accessDenied = null;
+        // Index 0 is the user, already read above. An entry we cannot read
+        // is skipped so a later hit (the partition root, the Login Policy)
+        // is not hidden, and is reported only when nothing was found.
+        for (int i = 1; i < toRead.size(); i++) {
+            String dn = toRead.get(i);
+            try {
+                SearchResultEntry entry = readEntryIfPresent(dn, EdirPasswordPolicy.POLICY_ATTRIBUTE);
+                policies.put(dn, entry == null
+                        ? null
+                        : attributeOrNull(entry, EdirPasswordPolicy.POLICY_ATTRIBUTE));
+            } catch (LDAPException e) {
+                if (e.getResultCode() != ResultCode.INSUFFICIENT_ACCESS_RIGHTS) throw e;
+                accessDenied = e;
+            }
+        }
+
+        String loginDN = null;
+        try {
+            SearchResultEntry login = findLoginPolicyEntry(contexts);
+            loginDN = login == null ? null : login.getDN();
+            if (login != null) {
+                policies.put(loginDN, attributeOrNull(login, EdirPasswordPolicy.POLICY_ATTRIBUTE));
+            }
+        } catch (LDAPException e) {
+            if (e.getResultCode() != ResultCode.INSUFFICIENT_ACCESS_RIGHTS) throw e;
+            accessDenied = e;
+        }
+
+        EdirPasswordPolicy.Assignment found =
+                EdirPasswordPolicy.resolve(userDN, policies, contexts, loginDN);
+        if (found == null && accessDenied != null) throw accessDenied;
+        return found;
+    }
+
+    /**
+     * True when the live socket is TLS. A connected cleartext socket is not
+     * treated as secure just because the configured port is 636.
+     */
+    public boolean isSecureConnection() {
+        boolean connected = connection != null && connection.isConnected();
+        boolean ssl = false;
+        if (connection != null) {
+            try {
+                ssl = connection.getSSLSession() != null;
+            } catch (RuntimeException ignored) {
+                ssl = false;
+            }
+        }
+        boolean useTls = currentConfig != null && currentConfig.isUseTLS();
+        int port = currentConfig != null ? currentConfig.getPort() : 0;
+        return EdirPasswordPolicy.connectionIsSecure(connected, ssl, useTls, port);
+    }
+
+    private SearchResultEntry readEntryRequired(String dn, String attribute) throws LDAPException {
+        try {
+            SearchResultEntry entry = connection.getEntry(dn, attribute);
+            if (entry == null) {
+                throw new LDAPException(ResultCode.NO_SUCH_OBJECT, "Entry not found: " + dn);
+            }
+            return entry;
+        } catch (LDAPException e) {
+            if (e.getResultCode() == ResultCode.NO_SUCH_OBJECT) {
+                throw new LDAPException(ResultCode.NO_SUCH_OBJECT, "Entry not found: " + dn, e);
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * Base-level read. Missing entries, referrals, and unparsable DNs are
+     * "not present". Any other failure (including insufficient rights) is
+     * raised so a policy we could not see is not reported as absent.
+     */
+    private SearchResultEntry readEntryIfPresent(String dn, String attribute) throws LDAPException {
+        try {
+            return connection.getEntry(dn, attribute);
+        } catch (LDAPException e) {
+            ResultCode rc = e.getResultCode();
+            if (rc == ResultCode.NO_SUCH_OBJECT
+                    || rc == ResultCode.INVALID_DN_SYNTAX
+                    || rc == ResultCode.REFERRAL) {
+                return null;
+            }
+            throw e;
+        }
+    }
+
+    private static String attributeOrNull(SearchResultEntry entry, String attribute) {
+        if (entry == null) return null;
+        String value = entry.getAttributeValue(attribute);
+        if (value == null || value.isBlank()) return null;
+        return value;
+    }
+
+    /**
+     * Locate {@code cn=Login Policy} under the Security container. Tries the
+     * well-known DNs first, then a one-level search. An access failure is
+     * remembered and rethrown only when no Login Policy entry was found, so
+     * a missing {@code cn=Security} at the root does not hide the real one
+     * under a naming context — and a Security container we cannot read is
+     * not treated as "no policy".
+     */
+    private SearchResultEntry findLoginPolicyEntry(List<String> namingContexts) throws LDAPException {
+        LDAPException accessDenied = null;
+        for (String dn : EdirPasswordPolicy.loginPolicyCandidates(namingContexts)) {
+            try {
+                SearchResultEntry entry = connection.getEntry(dn, EdirPasswordPolicy.POLICY_ATTRIBUTE);
+                if (entry != null) return entry;
+            } catch (LDAPException e) {
+                if (e.getResultCode() == ResultCode.INSUFFICIENT_ACCESS_RIGHTS) {
+                    accessDenied = e;
+                    continue;
+                }
+                if (e.getResultCode() == ResultCode.NO_SUCH_OBJECT
+                        || e.getResultCode() == ResultCode.INVALID_DN_SYNTAX
+                        || e.getResultCode() == ResultCode.REFERRAL) {
+                    continue;
+                }
+                throw e;
+            }
+        }
+        for (String base : EdirPasswordPolicy.securityContainerCandidates(namingContexts)) {
+            try {
+                SearchResultEntry entry = searchLoginPolicy(base);
+                if (entry != null) return entry;
+            } catch (LDAPException e) {
+                if (e.getResultCode() == ResultCode.INSUFFICIENT_ACCESS_RIGHTS) {
+                    accessDenied = e;
+                    continue;
+                }
+                throw e;
+            }
+        }
+        if (accessDenied != null) throw accessDenied;
+        return null;
+    }
+
+    private SearchResultEntry searchLoginPolicy(String base) throws LDAPException {
+        SearchRequest request = new SearchRequest(base,
+                com.unboundid.ldap.sdk.SearchScope.ONE,
+                "(cn=Login Policy)",
+                EdirPasswordPolicy.POLICY_ATTRIBUTE);
+        request.setSizeLimit(1);
+        request.setTimeLimitSeconds(15);
+        try {
+            SearchResult result = connection.search(request);
+            if (result.getSearchEntries().isEmpty()) return null;
+            return result.getSearchEntries().getFirst();
+        } catch (LDAPSearchException e) {
+            if (e.getResultCode() == ResultCode.SIZE_LIMIT_EXCEEDED
+                    && e.getSearchResult() != null
+                    && !e.getSearchResult().getSearchEntries().isEmpty()) {
+                return e.getSearchResult().getSearchEntries().getFirst();
+            }
+            if (e.getResultCode() == ResultCode.NO_SUCH_OBJECT
+                    || e.getResultCode() == ResultCode.REFERRAL
+                    || e.getResultCode() == ResultCode.INVALID_DN_SYNTAX) {
+                return null;
+            }
+            throw e;
+        }
     }
 
     // --- Active Directory Helpers ---

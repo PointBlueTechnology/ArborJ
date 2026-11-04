@@ -2,7 +2,9 @@ package com.pointbluetech.arborj.view;
 
 import com.pointbluetech.arborj.controller.MainController;
 import com.pointbluetech.arborj.model.DirectoryType;
+import com.pointbluetech.arborj.util.EdirPasswordPolicy;
 import javafx.application.Platform;
+import javafx.beans.binding.Bindings;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
 import javafx.scene.control.*;
@@ -14,9 +16,15 @@ import javafx.scene.text.Font;
  * based on the connected directory type.
  *
  * - Active Directory: new password only, plus UAC flag checkboxes.
- * - eDirectory / Generic / OpenLDAP: RFC 3062 Password Modify. Supports
- *   self-service (current + new password) and administrative reset
- *   (new password only — uses the connected admin's rights).
+ * - eDirectory: shows the Universal Password policy that applies (read from
+ *   {@code nspmPasswordPolicyDN} on the user, the parent container, the
+ *   partition root, or the Login Policy). When none applies, the user
+ *   chooses Universal Password (RFC 3062) or Legacy NDS (replace
+ *   {@code userPassword} over LDAPS). Password Modify failures 53 / 19 /
+ *   NMAS offer a legacy retry.
+ * - Generic / OpenLDAP: RFC 3062 Password Modify. Supports self-service
+ *   (current + new password) and administrative reset (new password only —
+ *   uses the connected admin's rights).
  */
 public class ChangePasswordDialog extends Dialog<Void> {
 
@@ -33,6 +41,20 @@ public class ChangePasswordDialog extends Dialog<Void> {
     // when the bound user has reset rights on the target).
     private final CheckBox adminResetCheckbox =
             new CheckBox("Administrative reset (don't require current password)");
+
+    // eDirectory: policy status and, when no Universal Password policy
+    // applies, which write to send.
+    private final Label policyStatusLabel =
+            new Label("Checking whether a Universal Password policy applies…");
+    private final Label policyDnLabel = new Label();
+    private final RadioButton universalRadio =
+            new RadioButton("Universal Password (Password Modify)");
+    private final RadioButton legacyRadio =
+            new RadioButton("Legacy NDS (replace userPassword)");
+    private final ToggleGroup methodGroup = new ToggleGroup();
+    private final VBox methodBox = new VBox(4);
+    private final Label legacySecureHint = new Label(
+            "Legacy NDS replaces userPassword and needs an LDAPS connection.");
 
     // AD-specific controls
     private final CheckBox mustChangeCheckbox = new CheckBox("User must change password at next logon");
@@ -66,7 +88,7 @@ public class ChangePasswordDialog extends Dialog<Void> {
 
         VBox content = buildContent(dirType);
         content.setPadding(new Insets(12));
-        content.setPrefWidth(450);
+        content.setPrefWidth(520);
 
         getDialogPane().setContent(content);
 
@@ -90,6 +112,13 @@ public class ChangePasswordDialog extends Dialog<Void> {
         if (dirType == DirectoryType.ACTIVE_DIRECTORY) {
             okBtn.setDisable(true);
             fetchADFlags(okBtn);
+        }
+
+        // For eDirectory, read the Universal Password policy before OK is
+        // enabled so the default method matches what the tree actually has.
+        if (dirType == DirectoryType.EDIRECTORY) {
+            okBtn.setDisable(true);
+            loadEdirPolicy(okBtn);
         }
     }
 
@@ -116,8 +145,35 @@ public class ChangePasswordDialog extends Dialog<Void> {
 
         form.add(new Separator(), 0, row++, 2, 1);
 
+        if (dirType == DirectoryType.EDIRECTORY) {
+            policyStatusLabel.setWrapText(true);
+            policyDnLabel.setFont(Font.font("monospaced", 11));
+            policyDnLabel.setWrapText(true);
+            policyDnLabel.setVisible(false);
+            policyDnLabel.setManaged(false);
+            VBox policyBox = new VBox(2, policyStatusLabel, policyDnLabel);
+            form.add(policyBox, 0, row++, 2, 1);
+
+            universalRadio.setToggleGroup(methodGroup);
+            legacyRadio.setToggleGroup(methodGroup);
+            universalRadio.setSelected(true);
+            Label methodLabel = new Label("Method");
+            methodLabel.setStyle("-fx-font-weight: bold;");
+            legacySecureHint.setWrapText(true);
+            legacySecureHint.setStyle("-fx-font-size: 11px;");
+            legacySecureHint.setVisible(false);
+            legacySecureHint.setManaged(false);
+            methodBox.getChildren().addAll(methodLabel, universalRadio, legacyRadio, legacySecureHint);
+            // Hidden until the policy read finishes. Shown only when no
+            // Universal Password policy applies.
+            methodBox.setVisible(false);
+            methodBox.setManaged(false);
+            form.add(methodBox, 0, row++, 2, 1);
+        }
+
         // Current password -- shown for non-AD directories, and only when
-        // an administrative reset is NOT being performed.
+        // an administrative reset is NOT being performed. Legacy NDS is a
+        // userPassword replace and does not send the current password.
         boolean showOldPassword = dirType != DirectoryType.ACTIVE_DIRECTORY;
         Label currentLabel = new Label("Current Password:");
         if (showOldPassword) {
@@ -127,12 +183,15 @@ public class ChangePasswordDialog extends Dialog<Void> {
             // Empty placeholder cell + checkbox in the value column
             form.add(adminResetCheckbox, 1, row++);
 
-            // Hide current-password row when admin-reset is checked. Keeps the
-            // form compact and makes the active mode obvious at a glance.
-            currentLabel.visibleProperty().bind(adminResetCheckbox.selectedProperty().not());
+            var showCurrent = Bindings.and(
+                    adminResetCheckbox.selectedProperty().not(),
+                    legacyRadio.selectedProperty().not());
+            currentLabel.visibleProperty().bind(showCurrent);
             currentLabel.managedProperty().bind(currentLabel.visibleProperty());
-            currentPasswordField.visibleProperty().bind(adminResetCheckbox.selectedProperty().not());
+            currentPasswordField.visibleProperty().bind(showCurrent);
             currentPasswordField.managedProperty().bind(currentPasswordField.visibleProperty());
+            adminResetCheckbox.visibleProperty().bind(legacyRadio.selectedProperty().not());
+            adminResetCheckbox.managedProperty().bind(adminResetCheckbox.visibleProperty());
             // Clear the field when switching to admin-reset so a stale value
             // can't accidentally be sent.
             adminResetCheckbox.selectedProperty().addListener((obs, was, now) -> {
@@ -219,8 +278,10 @@ public class ChangePasswordDialog extends Dialog<Void> {
             confirmPasswordField.requestFocus();
             return;
         }
-        // Self-service (non-admin) on non-AD requires the current password.
+        // Self-service (non-admin) Password Modify requires the current
+        // password. A legacy NDS replace does not send one.
         if (dirType != DirectoryType.ACTIVE_DIRECTORY
+                && !legacyRadio.isSelected()
                 && !adminResetCheckbox.isSelected()
                 && currentPasswordField.getText().isEmpty()) {
             showError("Current password is required.\n\n"
@@ -246,8 +307,12 @@ public class ChangePasswordDialog extends Dialog<Void> {
                     }
                 }
                 case EDIRECTORY -> {
-                    String oldPassword = effectiveOldPassword();
-                    controller.getLdapService().changePasswordEDir(targetDN, oldPassword, newPassword);
+                    if (legacyRadio.isSelected()) {
+                        controller.getLdapService().changePasswordLegacyNDS(targetDN, newPassword);
+                    } else {
+                        controller.getLdapService().changePasswordEDir(
+                                targetDN, effectiveOldPassword(), newPassword);
+                    }
                 }
                 default -> {
                     // Generic / OpenLDAP -- RFC 3062
@@ -259,10 +324,99 @@ public class ChangePasswordDialog extends Dialog<Void> {
         } catch (Exception ex) {
             // The service already prefixes its message with "Password change
             // failed:" and includes the LDAP result code; don't double-prefix.
-            String msg = ex.getMessage();
-            if (msg == null || msg.isBlank()) msg = "Password change failed.";
+            String msg = messageOf(ex);
+            if (dirType == DirectoryType.EDIRECTORY
+                    && !legacyRadio.isSelected()
+                    && EdirPasswordPolicy.passwordModifySuggestsLegacy(ex)) {
+                offerLegacyRetry(msg);
+                return;
+            }
             showError(msg);
         }
+    }
+
+    /**
+     * Password Modify failed in the way a legacy-only tree fails (53, 19,
+     * or an NMAS error). Ask before replacing {@code userPassword}. A
+     * cleartext connection cannot do that replace, so the error stands.
+     */
+    private void offerLegacyRetry(String message) {
+        if (!controller.getLdapService().isSecureConnection()) {
+            showError(message
+                    + "\n\nA legacy NDS replace was not attempted because this "
+                    + "connection is not LDAPS.");
+            return;
+        }
+        Alert alert = new Alert(Alert.AlertType.CONFIRMATION);
+        alert.setTitle("Retry with Legacy NDS Password");
+        alert.setHeaderText("Retry by replacing userPassword?");
+        alert.setContentText(message
+                + "\n\nPassword Modify was rejected. Retry with Legacy NDS "
+                + "(replace userPassword over this LDAPS connection)? "
+                + "That is the modify Apache Directory Studio sends, and it "
+                + "does not go through Universal Password.");
+        alert.getButtonTypes().setAll(ButtonType.YES, ButtonType.NO);
+        var window = ownerWindow();
+        if (window != null) alert.initOwner(window);
+        var choice = alert.showAndWait();
+        if (choice.isEmpty() || choice.get() != ButtonType.YES) return;
+        try {
+            controller.getLdapService().changePasswordLegacyNDS(targetDN, newPasswordField.getText());
+            close();
+        } catch (Exception retryEx) {
+            showError(messageOf(retryEx));
+        }
+    }
+
+    private void loadEdirPolicy(Button okBtn) {
+        Thread.ofVirtual().start(() -> {
+            EdirPasswordPolicy.Assignment assignment = null;
+            String failure = null;
+            try {
+                assignment = controller.getLdapService().findUniversalPasswordPolicy(targetDN);
+            } catch (Exception e) {
+                failure = e.getMessage() == null || e.getMessage().isBlank()
+                        ? e.toString() : e.getMessage();
+            }
+            EdirPasswordPolicy.Assignment found = assignment;
+            String error = failure;
+            boolean secure = false;
+            try {
+                secure = controller.getLdapService().isSecureConnection();
+            } catch (Exception ignored) {
+                secure = false;
+            }
+            boolean secureConnection = secure;
+            Platform.runLater(() -> {
+                policyStatusLabel.setText(EdirPasswordPolicy.describeStatus(found, error));
+                boolean hasPolicy = found != null;
+                policyDnLabel.setText(hasPolicy ? found.policyDN() : "");
+                policyDnLabel.setVisible(hasPolicy);
+                policyDnLabel.setManaged(hasPolicy);
+
+                boolean offer = EdirPasswordPolicy.offerMethodChoice(found);
+                methodBox.setVisible(offer);
+                methodBox.setManaged(offer);
+                legacyRadio.setDisable(!secureConnection);
+                legacySecureHint.setVisible(offer && !secureConnection);
+                legacySecureHint.setManaged(offer && !secureConnection);
+
+                EdirPasswordPolicy.Method method = EdirPasswordPolicy.defaultMethod(
+                        found, error != null, secureConnection);
+                if (method == EdirPasswordPolicy.Method.LEGACY_NDS) {
+                    legacyRadio.setSelected(true);
+                } else {
+                    universalRadio.setSelected(true);
+                }
+                okBtn.setDisable(false);
+            });
+        });
+    }
+
+    private static String messageOf(Exception ex) {
+        String msg = ex.getMessage();
+        if (msg == null || msg.isBlank()) return "Password change failed.";
+        return msg;
     }
 
     /**
@@ -282,13 +436,17 @@ public class ChangePasswordDialog extends Dialog<Void> {
         alert.setTitle("Error");
         alert.setHeaderText(null);
         alert.setContentText(message);
-        // Belt-and-suspenders: even with the addEventFilter fix, an error from
-        // the constructor's async fetchADFlags can fire before the dialog has
-        // a scene, so guard the owner lookup.
-        var pane = getDialogPane();
-        var scene = (pane != null) ? pane.getScene() : null;
-        var window = (scene != null) ? scene.getWindow() : null;
+        var window = ownerWindow();
         if (window != null) alert.initOwner(window);
         alert.showAndWait();
+    }
+
+    private javafx.stage.Window ownerWindow() {
+        // Belt-and-suspenders: even with the addEventFilter fix, an error from
+        // the constructor's async policy / UAC read can fire before the dialog
+        // has a scene, so guard the owner lookup.
+        var pane = getDialogPane();
+        var scene = (pane != null) ? pane.getScene() : null;
+        return (scene != null) ? scene.getWindow() : null;
     }
 }
