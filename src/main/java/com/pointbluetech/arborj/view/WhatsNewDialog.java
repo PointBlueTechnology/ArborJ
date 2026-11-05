@@ -71,6 +71,19 @@ public class WhatsNewDialog {
         features.setPadding(new Insets(8, 0, 8, 0));
 
         features.getChildren().addAll(
+                featureItem("eDirectory Password Policy Check",
+                        "Change Password now asks NMAS which Universal Password policy "
+                        + "applies to the user, including policies inherited from "
+                        + "containers, the partition root, and the Login Policy, and "
+                        + "shows it before you type a new password."),
+
+                featureItem("Legacy NDS Password Option",
+                        "On trees with only legacy NDS password rules, where Password "
+                        + "Modify is refused, ArborJ offers a direct userPassword "
+                        + "replace over LDAPS and defaults to it when no Universal "
+                        + "Password policy applies. Passwords never appear in the "
+                        + "activity log."),
+
                 featureItem("Updated JavaFX",
                         "ArborJ now uses JavaFX 25.0.5 with the latest security and "
                         + "stability fixes, and bundles Java 25.0.5."),
