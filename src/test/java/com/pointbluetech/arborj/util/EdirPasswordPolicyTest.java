@@ -236,4 +236,16 @@ class EdirPasswordPolicyTest {
         assertTrue(EdirPasswordPolicy.connectionIsSecure(false, false, false, 636));
         assertFalse(EdirPasswordPolicy.connectionIsSecure(false, false, false, 389));
     }
+
+    @Test
+    @DisplayName("live eDirectory 9.2.8 response with long-form length decodes to the policy DN")
+    void liveEDirectoryLongFormLength() {
+        byte[] live = HexFormat.of().parseHex(
+                "3084000000420201010201"
+              + "00043a636e3d53616d706c652050617373776f726420506f6c6963792c636e3d50617373"
+              + "776f726420506f6c69636965732c636e3d5365637572697479");
+        PolicyLookup lookup = EdirPasswordPolicy.decodeResponse(live);
+        assertEquals(Status.POLICY, lookup.status());
+        assertEquals("cn=Sample Password Policy,cn=Password Policies,cn=Security", lookup.policyDN());
+    }
 }
