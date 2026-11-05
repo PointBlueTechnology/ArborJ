@@ -4,6 +4,7 @@ import com.pointbluetech.arborj.model.CertificateDetails;
 import com.pointbluetech.arborj.model.EffectiveRights;
 import com.pointbluetech.arborj.model.LDAPConnectionConfig;
 import com.pointbluetech.arborj.model.LDAPEntry;
+import com.pointbluetech.arborj.util.EdirPasswordPolicy;
 import com.unboundid.ldap.sdk.*;
 import com.unboundid.ldap.sdk.controls.SimplePagedResultsControl;
 import com.unboundid.ldap.sdk.extensions.PasswordModifyExtendedRequest;
@@ -493,9 +494,12 @@ public class LDAPService {
      * leaves the actual reason in the LDAP result code or in the matched-DN
      * field. We surface all available pieces so the user can see the real
      * cause (too short, unique-policy violation, password expired, etc.).
+     *
+     * <p>Package-visible so unit tests can lock this wording. The dialog
+     * shows the string as-is.
      */
-    private static String formatPasswordError(ResultCode rc, String diagnostic,
-                                              String matchedDN, Control[] controls) {
+    static String formatPasswordError(ResultCode rc, String diagnostic,
+                                      String matchedDN, Control[] controls) {
         StringBuilder sb = new StringBuilder("Password change failed: ");
 
         // Try to find a more specific reason than the generic NMAS message.
@@ -548,7 +552,7 @@ public class LDAPService {
         // 2.16.840.1.113719.1.27.103.* — the value typically encodes a
         // 32-bit signed NMAS error code as the first 4 BE bytes.
         for (Control c : controls) {
-            if (c.getOID() != null && c.getOID().startsWith("2.16.840.1.113719.1.27.103.")) {
+            if (c.getOID() != null && c.getOID().startsWith(EdirPasswordPolicy.NMAS_CONTROL_PREFIX)) {
                 ASN1OctetString val = c.getValue();
                 if (val == null) continue;
                 byte[] bytes = val.getValue();
@@ -567,7 +571,8 @@ public class LDAPService {
      * Map well-known NMAS / NDS error codes to human-readable text. Codes are
      * defined in eDirectory's nmasapi.h (negative values).
      */
-    private static String decodeNmasCode(int code) {
+    /** Package-visible so unit tests can lock the NMAS code map. */
+    static String decodeNmasCode(int code) {
         return switch (code) {
             case -215 -> "Password unique violation (matches a previous password)";
             case -216 -> "Password too short";
@@ -613,12 +618,90 @@ public class LDAPService {
     }
 
     /**
-     * eDirectory DirXML password change (universal password).
+     * eDirectory Universal Password change. This is the RFC 3062 Password
+     * Modify extended operation (NMAS). Trees with only legacy NDS password
+     * rules reject it; use {@link #changePasswordLegacyNDS} there.
      */
     public void changePasswordEDir(String dn, String oldPassword, String newPassword)
             throws LDAPException {
-        // eDirectory uses RFC 3062 but may also support DirXML extended op
         changePasswordRFC3062(dn, oldPassword, newPassword);
+    }
+
+    /**
+     * Legacy NDS password set: REPLACE {@code userPassword}. This is the
+     * modify Apache Directory Studio sends, and it is what succeeds on an
+     * eDirectory tree that has no Universal Password policy. eDirectory
+     * accepts a cleartext {@code userPassword} only on a secure connection,
+     * so a plaintext socket is refused before the modify is sent.
+     */
+    public void changePasswordLegacyNDS(String dn, String newPassword) throws LDAPException {
+        if (newPassword == null || newPassword.isEmpty()) {
+            throw new LDAPException(ResultCode.CONSTRAINT_VIOLATION,
+                    "New password must not be empty.");
+        }
+        // Connect first, then judge the live socket. A disconnected config
+        // with useTLS or port 636 must not count as a secure channel.
+        ensureWritable();
+        if (!isSecureConnection()) {
+            throw new LDAPException(ResultCode.CONFIDENTIALITY_REQUIRED,
+                    "Legacy NDS password changes replace userPassword and require "
+                            + "a secure connection (LDAPS).");
+        }
+        modifyAttribute(dn, "userPassword", LDAPModifyOperation.REPLACE, List.of(newPassword));
+    }
+
+    /**
+     * Read-only: which Universal Password policy NMAS applies to
+     * {@code userDN}, from the NMAS Get password policy information extended
+     * operation. NMAS does the inheritance (user, container, partition root,
+     * Login Policy). A failed or unsupported operation is
+     * {@link EdirPasswordPolicy.Status#UNKNOWN}, never "no policy".
+     */
+    public EdirPasswordPolicy.PolicyLookup findUniversalPasswordPolicy(String userDN)
+            throws LDAPException {
+        ensureConnected();
+        LDAPConnection conn = connection;
+        if (conn == null) throw new LDAPException(ResultCode.SERVER_DOWN, "Not connected");
+        ExtendedResult result;
+        try {
+            result = conn.processExtendedOperation(
+                    EdirPasswordPolicy.GET_POLICY_INFO_REQUEST_OID,
+                    EdirPasswordPolicy.encodeRequest(userDN));
+        } catch (LDAPException e) {
+            return EdirPasswordPolicy.PolicyLookup.unknown(describeResult(
+                    e.getResultCode(), e.getDiagnosticMessage()));
+        }
+        if (result.getResultCode() != ResultCode.SUCCESS) {
+            return EdirPasswordPolicy.PolicyLookup.unknown(describeResult(
+                    result.getResultCode(), result.getDiagnosticMessage()));
+        }
+        return EdirPasswordPolicy.decodeResponse(
+                result.getValue() == null ? null : result.getValue().getValue());
+    }
+
+    private static String describeResult(ResultCode rc, String diagnostic) {
+        String text = rc == null ? "error" : rc.getName() + " (" + rc.intValue() + ")";
+        if (diagnostic != null && !diagnostic.isBlank()) text += ": " + diagnostic.trim();
+        return text;
+    }
+
+    /**
+     * True when the live socket is TLS. A connected cleartext socket is not
+     * treated as secure just because the configured port is 636.
+     */
+    public boolean isSecureConnection() {
+        boolean connected = connection != null && connection.isConnected();
+        boolean ssl = false;
+        if (connection != null) {
+            try {
+                ssl = connection.getSSLSession() != null;
+            } catch (RuntimeException ignored) {
+                ssl = false;
+            }
+        }
+        boolean useTls = currentConfig != null && currentConfig.isUseTLS();
+        int port = currentConfig != null ? currentConfig.getPort() : 0;
+        return EdirPasswordPolicy.connectionIsSecure(connected, ssl, useTls, port);
     }
 
     // --- Active Directory Helpers ---
