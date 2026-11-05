@@ -196,6 +196,8 @@ class EdirPasswordPolicyTest {
             assertFalse(EdirPasswordPolicy.offerLegacyRetry(PolicyLookup.none(),
                     new LDAPException(ResultCode.OTHER, "NMAS failed", "-16049", null)));
             assertFalse(EdirPasswordPolicy.offerLegacyRetry(PolicyLookup.none(),
+                    new LDAPException(ResultCode.OTHER, "NMAS failed", "-224", null)));
+            assertFalse(EdirPasswordPolicy.offerLegacyRetry(PolicyLookup.none(),
                     new LDAPException(ResultCode.OTHER, "outer",
                             new LDAPException(ResultCode.OTHER, "NDS", "-672", null))));
         }

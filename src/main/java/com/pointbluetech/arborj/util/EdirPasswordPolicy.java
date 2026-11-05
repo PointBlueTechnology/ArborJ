@@ -51,9 +51,9 @@ public final class EdirPasswordPolicy {
     /**
      * NMAS / NDS codes that mean the bound account may not set this password.
      * A legacy replace would only hit the same wall, so it is not offered.
-     * -16049 NMAS insufficient rights, -672 NDS no access.
+     * -224 and -16049 insufficient rights, -672 NDS no access.
      */
-    private static final Set<Integer> RIGHTS_CODES = Set.of(-16049, -672);
+    private static final Set<Integer> RIGHTS_CODES = Set.of(-224, -672, -16049);
 
     private EdirPasswordPolicy() {
     }
