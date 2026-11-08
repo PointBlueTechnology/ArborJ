@@ -112,6 +112,45 @@ public class SchemaService {
         applyRDNAttIDs(objectClassMap, adRdnAttIds);
     }
 
+    /**
+     * Union of MUST and MAY attribute names (lowercased) for an entry's
+     * object classes. Returns null when the set cannot be determined — no
+     * object classes, schema not loaded, or none of the classes matched.
+     * Callers treat null as "don't filter; allow any attribute in the schema."
+     */
+    public static Set<String> allowedAttributeNames(Map<String, LDAPObjectClassInfo> objectClassMap,
+                                                     List<String> objectClasses) {
+        if (objectClasses == null || objectClasses.isEmpty()) return null;
+        if (objectClassMap == null || objectClassMap.isEmpty()) return null;
+        Set<String> allowed = new HashSet<>();
+        for (String oc : objectClasses) {
+            LDAPObjectClassInfo info = objectClassMap.get(oc.toLowerCase());
+            if (info == null) continue;
+            for (String a : info.getMustAttributes()) allowed.add(a.toLowerCase());
+            for (String a : info.getMayAttributes()) allowed.add(a.toLowerCase());
+        }
+        return allowed.isEmpty() ? null : allowed;
+    }
+
+    /**
+     * Prefix matches for Add Attribute autocomplete, using lowercase schema
+     * attribute names. When {@code allowedLower} is non-null, only those
+     * attributes are included. At most 12 matches, sorted.
+     */
+    public static List<String> suggestAttributeNames(Map<String, LDAPAttributeInfo> attributeMap,
+                                                      Set<String> allowedLower,
+                                                      String typed) {
+        if (attributeMap == null || attributeMap.isEmpty()) return List.of();
+        String lower = typed == null ? "" : typed.toLowerCase().trim();
+        if (lower.length() < 1) return List.of();
+        return attributeMap.keySet().stream()
+                .filter(n -> n.startsWith(lower))
+                .filter(n -> allowedLower == null || allowedLower.contains(n))
+                .sorted()
+                .limit(12)
+                .toList();
+    }
+
     public Set<String> getContainerClasses() {
         return containerClasses != null ? containerClasses : WELL_KNOWN_CONTAINERS;
     }
@@ -254,7 +293,7 @@ public class SchemaService {
     /** Raw attribute info for SUP chain resolution. */
     private record RawAttr(String name, String directOID, String sup, boolean singleValued, boolean operational) {}
 
-    private Map<String, LDAPAttributeInfo> loadAttributeMap(Schema schema) throws LDAPException {
+    Map<String, LDAPAttributeInfo> loadAttributeMap(Schema schema) throws LDAPException {
         if (schema == null) {
             if (detectedType == DirectoryType.ACTIVE_DIRECTORY) {
                 return buildADFallbackMap();
@@ -308,7 +347,7 @@ public class SchemaService {
 
     // --- ObjectClass Map ---
 
-    private Map<String, LDAPObjectClassInfo> loadObjectClassMap(Schema schema) {
+    Map<String, LDAPObjectClassInfo> loadObjectClassMap(Schema schema) {
         Map<String, LDAPObjectClassInfo> map = new LinkedHashMap<>();
 
         if (schema == null) return map;
